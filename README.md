@@ -22,7 +22,7 @@
 ### 下载
 
 #### 方式一：直接下载 Release
-从 [Releases](https://github.com/your-username/png-watermark/releases) 页面下载最新版的 `watermark.exe`。
+从 [Releases](https://github.com/GiftsfromtheRiver/PNG-Invisible-Watermark-Tool/releases) 页面下载最新版的 `watermark.exe`。
 
 #### 方式二：从源码编译
 
