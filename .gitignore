@@ -67,3 +67,26 @@ vcpkg_installed/
 # test output & cache
 Testing/
 .cache/
+
+# 编译产物
+*.exe
+*.exe~
+*.a
+*.dylib
+*.dll
+
+# 编译器临时文件
+*.swo
+
+# IDE
+.vscode/
+.idea/
+*.user
+*.suo
+
+# 输出图片
+*_steg.png
+
+# 系统文件
+Thumbs.db
+.DS_Store
