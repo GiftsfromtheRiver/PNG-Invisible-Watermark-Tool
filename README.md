@@ -16,24 +16,32 @@
 - 🌐 **跨平台** — 支持 Windows / Linux / macOS
 - 📦 **完全本地** — 无需联网，图片不上传任何服务器
 
+## 🖼️ 效果演示
+
+| 原图 | 嵌入水印后（肉眼无差异） |
+|------|------------------------|
+| ![原图](1727249064_kaDJnbDS_E19990A0-B96E-4E66-9EF9-F1E11.png) | ![水印图](1727249064_kaDJnbDS_E19990A0-B96E-4E66-9EF9-F1E11_steg.png) |
+
+> 两幅图在视觉上**完全一致**，但其中一幅隐藏了你的版权信息！
 
 ## 🚀 快速开始
 
-## 下载
+### 下载
 
-方式一：直接下载 Release
+#### 方式一：直接下载 Release
 从 [Releases](https://github.com/your-username/png-watermark/releases) 页面下载最新版的 `watermark.exe`。
 
-方式二：从源码编译
+#### 方式二：从源码编译
 
-克隆仓库
-git clone https://github.com/GiftsfromtheRiver/pPNG-Invisible-Watermark-Tool.git
+```bash
+# 克隆仓库
+git clone https://github.com/GiftsfromtheRiver/PNG-Invisible-Watermark-Tool.git
 cd png-watermark
 
-Windows (双击 build.bat 或在命令行运行)
+# Windows (双击 build.bat 或在命令行运行)
 build.bat
 
-Linux / macOS
+# Linux / macOS
 chmod +x build.sh
 ./build.sh
 环境要求
@@ -45,10 +53,13 @@ Linux/macOS: g++ 7.0+ 或 clang 5.0+
 交互模式（推荐）
 直接双击运行 watermark.exe，进入交互菜单：
 
+text
+╔══════════════════════════════════════╗
+║    PNG 不可见水印工具 v1.2          ║
+║    ±1 LSB Matching + 3x3 Block      ║
+║    支持单文件 / 文件夹批量           ║
+╚══════════════════════════════════════╝
 
-    PNG 不可见水印工具 v1.2          
-    ±1 LSB Matching + 3x3 Block      
-    支持单文件 / 文件夹批量           
 
 请选择功能:
   1. 嵌入水印 (Embed) [支持文件夹]
@@ -62,17 +73,19 @@ Linux/macOS: g++ 7.0+ 或 clang 5.0+
 命令行模式
 适合脚本化批量处理：
 
-嵌入水印
+bash
+# 嵌入水印
 watermark.exe embed input.png output.png 114514 "© 2026 MyArtStudio"
 
-提取水印
+# 提取水印
 watermark.exe extract stego.png 114514
 
-查询容量
+# 查询容量
 watermark.exe capacity input.png
 批量处理
 在交互模式中，输入文件夹路径即可批量处理所有 PNG 文件：
 
+text
 输入PNG路径 (文件或文件夹): D:/MyArt/
 找到 132 个 PNG 文件
 种子密钥: 114514
@@ -82,10 +95,11 @@ watermark.exe capacity input.png
   [1/132] D:/MyArt/pic1.png ... OK (128 bits)
   [2/132] D:/MyArt/pic2.png ... OK (256 bits)
   ...
-### 🔧 技术原理
+🔧 技术原理
 1. ±1 LSB Matching
 传统 LSB 替换会留下直方图阶梯痕迹，容易被隐写分析检测。±1 LSB Matching 在 LSB 不匹配时随机 ±1，保持直方图平滑，使水印更难被检测。
 
+text
 原始值: 100 (0b01100100)
 目标 bit: 1
 LSB 匹配 → 不修改
@@ -96,11 +110,12 @@ LSB 不匹配 → 随机 ±1 → 100 或 102
 2. 3×3 块标记
 每个 3×3 像素块中：
 
-
- 标记 标记 标记 
- 标记 数据 标记   ← 中心像素：存储 1 bit 数据
- 标记 标记 标记   ← 周边 8 像素：存储标记位（用于定位）
-
+text
+┌─────────────┐
+│ 标记 标记 标记 │
+│ 标记 数据 标记 │  ← 中心像素：存储 1 bit 数据
+│ 标记 标记 标记 │  ← 周边 8 像素：存储标记位（用于定位）
+└─────────────┘
 即使图片被裁剪或缩放，仍然可以通过标记位找到数据块的精确位置。
 
 3. RGB 三通道策略
@@ -130,21 +145,21 @@ png-watermark/
 ├── README.md                # 项目说明
 └── LICENSE                  # MIT License
 🛠️ 编译指南
-Windows：
-方式一：双击运行
+Windows
+bat
+# 方式一：双击运行
 build.bat
 
-方式二：命令行
+# 方式二：命令行
 g++ -std=c++17 -O2 -static -o watermark.exe watermark_tool.cpp watermark.cpp lodepng.cpp
-
-Linux / macOS：
-方式一：运行脚本
+Linux / macOS
+bash
+# 方式一：运行脚本
 chmod +x build.sh
 ./build.sh
 
-方式二：命令行
+# 方式二：命令行
 g++ -std=c++17 -O2 -o watermark watermark_tool.cpp watermark.cpp lodepng.cpp
-
 🤝 贡献指南
 欢迎提交 Issue 和 Pull Request！
 
@@ -169,11 +184,11 @@ LodePNG — 轻量级 PNG 编解码库 (zlib license)
 📧 联系方式
 GitHub: GiftsfromtheRiver
 
-Email: 2696888172l@qq.com
+Email: 26968881721@qq.com
 
 ⭐ Star History
 如果这个项目对你有帮助，请给个 Star！⭐
 
-https://api.star-history.com/svg?repos=your-username/png-watermark&type=Date
+
 
 保护你的创作，从不可见水印开始！ 🎨🔒
