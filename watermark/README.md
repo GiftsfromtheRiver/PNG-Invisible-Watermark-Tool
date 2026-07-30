@@ -35,7 +35,7 @@
 
 ```bash
 # 克隆仓库
-git clone https://github.com/your-username/png-watermark.git
+git clone https://github.com/GiftsfromtheRiver/PNG-Invisible-Watermark-Tool.git
 cd png-watermark
 
 # Windows (双击 build.bat 或在命令行运行)
@@ -182,9 +182,9 @@ LodePNG — 轻量级 PNG 编解码库 (zlib license)
 所有使用和反馈本工具的创作者们
 
 📧 联系方式
-GitHub: your-username
+GitHub: GiftsfromtheRiver
 
-Email: your-email@example.com
+Email: 26968881721@qq.com
 
 ⭐ Star History
 如果这个项目对你有帮助，请给个 Star！⭐
