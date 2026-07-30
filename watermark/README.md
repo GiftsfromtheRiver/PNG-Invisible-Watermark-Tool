@@ -189,6 +189,6 @@ Email: 26968881721@qq.com
 ⭐ Star History
 如果这个项目对你有帮助，请给个 Star！⭐
 
-https://api.star-history.com/svg?repos=your-username/png-watermark&type=Date
+
 
 保护你的创作，从不可见水印开始！ 🎨🔒
