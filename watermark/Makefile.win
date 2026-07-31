@@ -4,9 +4,9 @@
 CPP      = g++.exe
 CC       = gcc.exe
 WINDRES  = windres.exe
-OBJ      = lodepng.o watermark.o watermark_tool.o
-LINKOBJ  = lodepng.o watermark.o watermark_tool.o
-LIBS     = -L"C:/Program Files (x86)/Embarcadero/Dev-Cpp/TDM-GCC-64/lib" -L"C:/Program Files (x86)/Embarcadero/Dev-Cpp/TDM-GCC-64/x86_64-w64-mingw32/lib" -static-libgcc -lgdi32 -lcomctl32 -lcomdlg32 -static-libgcc -static-libstdc++ -lmsimg32  -std=c++17 -fexec-charset=UTF-8
+OBJ      = lodepng.o rs_codec.o watermark.o watermark_tool.o
+LINKOBJ  = lodepng.o rs_codec.o watermark.o watermark_tool.o
+LIBS     = -L"C:/Program Files (x86)/Embarcadero/Dev-Cpp/TDM-GCC-64/lib" -L"C:/Program Files (x86)/Embarcadero/Dev-Cpp/TDM-GCC-64/x86_64-w64-mingw32/lib" -static-libgcc -lgdi32 -lcomctl32 -lcomdlg32 -static-libgcc -static-libstdc++ -lmsimg32  -std=c++17 -fexec-charset=UTF-8  -mconsole
 INCS     = -I"C:/Program Files (x86)/Embarcadero/Dev-Cpp/TDM-GCC-64/include" -I"C:/Program Files (x86)/Embarcadero/Dev-Cpp/TDM-GCC-64/x86_64-w64-mingw32/include" -I"C:/Program Files (x86)/Embarcadero/Dev-Cpp/TDM-GCC-64/lib/gcc/x86_64-w64-mingw32/9.2.0/include"
 CXXINCS  = -I"C:/Program Files (x86)/Embarcadero/Dev-Cpp/TDM-GCC-64/include" -I"C:/Program Files (x86)/Embarcadero/Dev-Cpp/TDM-GCC-64/x86_64-w64-mingw32/include" -I"C:/Program Files (x86)/Embarcadero/Dev-Cpp/TDM-GCC-64/lib/gcc/x86_64-w64-mingw32/9.2.0/include" -I"C:/Program Files (x86)/Embarcadero/Dev-Cpp/TDM-GCC-64/lib/gcc/x86_64-w64-mingw32/9.2.0/include/c++"
 BIN      = watermark.exe
@@ -26,6 +26,9 @@ $(BIN): $(OBJ)
 
 lodepng.o: lodepng.cpp
 	$(CPP) -c lodepng.cpp -o lodepng.o $(CXXFLAGS)
+
+rs_codec.o: rs_codec.cpp
+	$(CPP) -c rs_codec.cpp -o rs_codec.o $(CXXFLAGS)
 
 watermark.o: watermark.cpp
 	$(CPP) -c watermark.cpp -o watermark.o $(CXXFLAGS)

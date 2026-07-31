@@ -1,4 +1,5 @@
 #include "watermark.h"
+#include "rs_codec.h"
 #include "lodepng.h"
 
 #include <random>
@@ -6,6 +7,7 @@
 #include <cstring>
 #include <numeric>
 #include <iostream>
+#include <map>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -24,8 +26,6 @@ inline uint8_t read_lsb(const uint8_t* image, size_t pixel_idx, int channel) {
     return image[pixel_idx * 4 + channel] & 1;
 }
 
-// ±1 嵌入：LSB 不匹配时随机 +1 或 -1，避免直方图阶梯分布
-// 方向由 FNV-1a(salt, pixel_idx, channel, extra) 决定，保证可重现
 inline void write_lsb_matching(uint8_t* image, size_t pixel_idx, int channel, 
                                 uint8_t bit, uint64_t salt, uint32_t extra = 0) {
     size_t idx = pixel_idx * 4 + channel;
@@ -33,10 +33,9 @@ inline void write_lsb_matching(uint8_t* image, size_t pixel_idx, int channel,
     uint8_t current_lsb = val & 1;
     
     if (current_lsb == bit) {
-        return; // 已匹配，不需要修改
+        return;
     }
     
-    // 确定性 hash 决定 ±1 方向
     uint64_t hash = 14695981039346656037ULL;
     hash ^= salt;
     hash *= 1099511628211ULL;
@@ -72,36 +71,30 @@ inline uint8_t compute_marker_bit(uint64_t salt, size_t block_id, int neighbor_o
 }
 
 // ---------- 块级 PRNG 打乱 ----------
-// 将图片分成不重叠的 3×3 网格块，用 PRNG 打乱块的顺序
-// 容量精确 = grid_cols * grid_rows，无浪费
 
 struct BlockGrid {
-    uint32_t grid_cols;  // 可用列数
-    uint32_t grid_rows;  // 可用行数
+    uint32_t grid_cols;
+    uint32_t grid_rows;
     uint32_t img_width;
     uint32_t img_height;
     
-    // block_id → 中心像素在图片中的索引
     size_t block_center(size_t block_id) const {
-        // block_id 映射到 grid 坐标
         size_t gr = block_id / grid_cols;
         size_t gc = block_id % grid_cols;
-        // 中心像素坐标 (从第1行/列开始，留边界)
         size_t cx = gc * 3 + 1;
         size_t cy = gr * 3 + 1;
         return cy * img_width + cx;
     }
     
-    // block_id → 3×3 块中所有 9 个像素的索引
-    void block_pixels(size_t block_id, size_t out[9]) const {
+    void block_pixels(size_t block_id, size_t out[9], int left_offset = 0, int top_offset = 0) const {
         size_t gr = block_id / grid_cols;
         size_t gc = block_id % grid_cols;
-        size_t base_x = gc * 3;  // 块左上角
-        size_t base_y = gr * 3;
+        int base_x = (int)(gc * 3) - left_offset;
+        int base_y = (int)(gr * 3) - top_offset;
         int idx = 0;
         for (int dy = 0; dy < 3; dy++) {
             for (int dx = 0; dx < 3; dx++) {
-                out[idx++] = (base_y + dy) * img_width + (base_x + dx);
+                out[idx++] = (size_t)(base_y + dy) * img_width + (size_t)(base_x + dx);
             }
         }
     }
@@ -113,12 +106,11 @@ BlockGrid make_grid(uint32_t width, uint32_t height) {
     BlockGrid g;
     g.img_width = width;
     g.img_height = height;
-    g.grid_cols = width / 3;   // 从第 0 列开始，每 3 列一个块
+    g.grid_cols = width / 3;
     g.grid_rows = height / 3;
     return g;
 }
 
-// 打乱块顺序
 std::vector<size_t> shuffle_blocks(size_t num_blocks, uint64_t salt) {
     std::vector<size_t> order(num_blocks);
     std::iota(order.begin(), order.end(), 0);
@@ -131,21 +123,18 @@ std::vector<size_t> shuffle_blocks(size_t num_blocks, uint64_t salt) {
     return order;
 }
 
-// 嵌入一个 3×3 块
 void embed_block(uint8_t* image,
                  const BlockGrid& grid,
                  int channel,
-                 size_t block_id,       // 原始块ID（用于计算像素位置）
+                 size_t block_id,
                  uint8_t data_bit,
                  uint64_t salt,
-                 uint64_t block_seq) {  // 序列号（用于标记的hash种子）
+                 uint64_t block_seq) {
     size_t pixels[9];
     grid.block_pixels(block_id, pixels);
     
-    // 中心像素(索引4)写数据 bit
     write_lsb_matching(image, pixels[4], channel, data_bit, salt, 0xFFFFFFFF);
     
-    // 周边 8 像素写标记
     for (int i = 0; i < 9; i++) {
         if (i == 4) continue;
         uint8_t marker = compute_marker_bit(salt, block_seq, i);
@@ -153,13 +142,13 @@ void embed_block(uint8_t* image,
     }
 }
 
-// 提取一个 3×3 块（只读中心像素 LSB）
 uint8_t extract_block(const uint8_t* image,
                       const BlockGrid& grid,
                       int channel,
-                      size_t block_id) {
+                      size_t block_id,
+                      int left_offset = 0, int top_offset = 0) {
     size_t pixels[9];
-    grid.block_pixels(block_id, pixels);
+    grid.block_pixels(block_id, pixels, left_offset, top_offset);
     return read_lsb(image, pixels[4], channel);
 }
 
@@ -212,16 +201,31 @@ bool decode_text_payload(const uint8_t* data, size_t data_len, std::string& out_
     return true;
 }
 
-// ---------- PNG 加载/保存（支持 Windows 中文路径） ----------
+// ---------- 大端编码/解码辅助 ----------
+
+void write_u32_be(uint8_t* buf, uint32_t val) {
+    buf[0] = (val >> 24) & 0xFF;
+    buf[1] = (val >> 16) & 0xFF;
+    buf[2] = (val >>  8) & 0xFF;
+    buf[3] =  val        & 0xFF;
+}
+
+uint32_t read_u32_be(const uint8_t* buf) {
+    return ((uint32_t)buf[0] << 24) |
+           ((uint32_t)buf[1] << 16) |
+           ((uint32_t)buf[2] <<  8) |
+            (uint32_t)buf[3];
+}
+
+// ---------- PNG 加载/保存 ----------
 
 struct PNGInfo {
-    std::vector<uint8_t> data;  // RGBA 像素数据
+    std::vector<uint8_t> data;
     uint32_t width = 0;
     uint32_t height = 0;
     bool has_alpha = false;
 };
 
-// Windows 下用宽字符读取文件
 static bool read_file_wide(const std::wstring& wpath, std::vector<unsigned char>& buffer) {
 #ifdef _WIN32
     FILE* file = _wfopen(wpath.c_str(), L"rb");
@@ -229,10 +233,7 @@ static bool read_file_wide(const std::wstring& wpath, std::vector<unsigned char>
     fseek(file, 0, SEEK_END);
     long size = ftell(file);
     fseek(file, 0, SEEK_SET);
-    if (size <= 0) {
-        fclose(file);
-        return false;
-    }
+    if (size <= 0) { fclose(file); return false; }
     buffer.resize(size);
     size_t read = fread(buffer.data(), 1, size, file);
     fclose(file);
@@ -242,7 +243,6 @@ static bool read_file_wide(const std::wstring& wpath, std::vector<unsigned char>
 #endif
 }
 
-// Windows 下用宽字符写入文件
 static bool write_file_wide(const std::wstring& wpath, const std::vector<unsigned char>& data) {
 #ifdef _WIN32
     FILE* file = _wfopen(wpath.c_str(), L"wb");
@@ -255,12 +255,10 @@ static bool write_file_wide(const std::wstring& wpath, const std::vector<unsigne
 #endif
 }
 
-// 将 UTF-8 字符串转为宽字符
 static std::wstring utf8_to_wstring(const std::string& str) {
 #ifdef _WIN32
     int len = MultiByteToWideChar(CP_UTF8, 0, str.c_str(), -1, nullptr, 0);
     if (len <= 0) {
-        // 降级到 ANSI (GBK)
         len = MultiByteToWideChar(CP_ACP, 0, str.c_str(), -1, nullptr, 0);
         if (len <= 0) return L"";
     }
@@ -279,50 +277,21 @@ PNGInfo load_png_info(const std::string& path) {
     
 #ifdef _WIN32
     std::wstring wpath = utf8_to_wstring(path);
-    if (wpath.empty()) {
-        info.width = info.height = 0;
-        return info;
-    }
-    
-    // 用宽字符读取文件
+    if (wpath.empty()) { info.width = info.height = 0; return info; }
     std::vector<unsigned char> buffer;
-    if (!read_file_wide(wpath, buffer)) {
-        info.width = info.height = 0;
-        return info;
-    }
-    
-    // 用 lodepng 解码内存数据
+    if (!read_file_wide(wpath, buffer)) { info.width = info.height = 0; return info; }
     error = lodepng::decode(info.data, info.width, info.height, buffer, LCT_RGBA, 8);
-    if (error != 0) {
-        info.width = info.height = 0;
-        return info;
-    }
-    
-    // 检测是否有 Alpha 通道
-    info.has_alpha = false;
-    for (size_t i = 3; i < info.data.size(); i += 4) {
-        if (info.data[i] != 255) {
-            info.has_alpha = true;
-            break;
-        }
-    }
-    return info;
+    if (error != 0) { info.width = info.height = 0; return info; }
 #else
-    // Linux / macOS：直接用
     error = lodepng::decode(info.data, info.width, info.height, path, LCT_RGBA, 8);
-    if (error != 0) {
-        info.width = info.height = 0;
-        return info;
-    }
+    if (error != 0) { info.width = info.height = 0; return info; }
+#endif
+    
     info.has_alpha = false;
     for (size_t i = 3; i < info.data.size(); i += 4) {
-        if (info.data[i] != 255) {
-            info.has_alpha = true;
-            break;
-        }
+        if (info.data[i] != 255) { info.has_alpha = true; break; }
     }
     return info;
-#endif
 }
 
 bool save_png_adaptive(const std::string& path,
@@ -352,7 +321,6 @@ bool save_png_adaptive(const std::string& path,
     if (wpath.empty()) return false;
     return write_file_wide(wpath, out);
 #else
-    // Linux / macOS：直接用 lodepng 保存
     if (save_as_rgb) {
         std::vector<uint8_t> rgb(width * height * 3);
         for (size_t i = 0; i < (size_t)width * height; i++) {
@@ -370,14 +338,245 @@ bool save_png_adaptive(const std::string& path,
 }
 
 // ---------- 通道分配 ----------
-// 始终只使用 RGB 三通道，不使用 Alpha
-// 原因：社交平台(QQ/微信等)传输 PNG 时可能剥离 Alpha 通道
-// ch0=B(2), ch1=G(1), ch2=R(0) → 3通道
 
 int channel_for_index(int idx, bool has_alpha) {
-    static const int ch[] = {2, 1, 0, -1};  // B, G, R
+    static const int ch[] = {2, 1, 0, -1};
     (void)has_alpha;
     return ch[idx];
+}
+
+// ---------- 嵌入/提取 bits 的通用流程 ----------
+
+// 将所有 bits 嵌入图片
+void embed_bits_to_image(uint8_t* image_data,
+                         const BlockGrid& grid,
+                         const std::vector<uint8_t>& bits,
+                         uint64_t salt,
+                         bool has_alpha) {
+    int num_channels = 3;
+    size_t blocks_per_channel = grid.total_blocks();
+    size_t bits_written = 0;
+    
+    for (int ci = 0; ci < num_channels && bits_written < bits.size(); ci++) {
+        int channel = channel_for_index(ci, has_alpha);
+        if (channel < 0) break;
+        
+        auto block_order = shuffle_blocks(blocks_per_channel, salt * 1000 + ci);
+        
+        for (size_t bi = 0; bi < block_order.size() && bits_written < bits.size(); bi++) {
+            size_t orig_block_id = block_order[bi];
+            embed_block(image_data, grid, channel, orig_block_id,
+                       bits[bits_written], salt, bi);
+            bits_written++;
+        }
+    }
+}
+
+// 从图片中提取所有 bits (最多 max_bits 个)
+std::vector<uint8_t> extract_bits_from_image(const uint8_t* image_data,
+                                              const BlockGrid& grid,
+                                              size_t max_bits,
+                                              uint64_t salt,
+                                              bool has_alpha) {
+    int num_channels = 3;
+    size_t blocks_per_channel = grid.total_blocks();
+    std::vector<uint8_t> all_bits;
+    all_bits.reserve(max_bits);
+    
+    for (int ci = 0; ci < num_channels; ci++) {
+        int channel = channel_for_index(ci, has_alpha);
+        if (channel < 0) break;
+        
+        auto block_order = shuffle_blocks(blocks_per_channel, salt * 1000 + ci);
+        
+        for (size_t bi = 0; bi < block_order.size(); bi++) {
+            size_t orig_block_id = block_order[bi];
+            uint8_t bit = extract_block(image_data, grid, channel, orig_block_id);
+            all_bits.push_back(bit);
+            if (all_bits.size() >= max_bits) return all_bits;
+        }
+    }
+    
+    return all_bits;
+}
+
+// ---------- 擦除感知提取 ----------
+
+// Check if all 9 pixels of a block are within image bounds
+bool block_in_bounds(const BlockGrid& grid, size_t block_id,
+                     uint32_t img_w, uint32_t img_h,
+                     int left_offset = 0, int top_offset = 0) {
+    size_t gr = block_id / grid.grid_cols;
+    size_t gc = block_id % grid.grid_cols;
+    int base_x = (int)(gc * 3) - left_offset;
+    int base_y = (int)(gr * 3) - top_offset;
+    return (base_x >= 0) && (base_x + 2 < (int)img_w) && 
+           (base_y >= 0) && (base_y + 2 < (int)img_h);
+}
+
+// Extract bits using original grid, marking out-of-bounds blocks as erasures
+std::vector<uint8_t> extract_bits_with_erasures(
+    const uint8_t* stego_data,
+    const BlockGrid& orig_grid,
+    uint32_t stego_w, uint32_t stego_h,
+    size_t max_bits,
+    uint64_t salt,
+    bool has_alpha,
+    std::vector<size_t>* out_erasure_bit_positions,
+    int left_offset, int top_offset) {
+    
+    int num_channels = 3;
+    size_t blocks_per_channel = orig_grid.total_blocks();
+    std::vector<uint8_t> all_bits;
+    all_bits.reserve(max_bits);
+    out_erasure_bit_positions->clear();
+    
+    // stego_grid uses screenshot dimensions for pixel addressing
+    BlockGrid stego_grid = orig_grid;
+    stego_grid.img_width = stego_w;
+    stego_grid.img_height = stego_h;
+    
+    for (int ci = 0; ci < num_channels; ci++) {
+        int channel = channel_for_index(ci, has_alpha);
+        if (channel < 0) break;
+        
+        auto block_order = shuffle_blocks(blocks_per_channel, salt * 1000 + ci);
+        
+        for (size_t bi = 0; bi < block_order.size(); bi++) {
+            size_t orig_block_id = block_order[bi];
+            size_t bit_pos = all_bits.size();
+            
+            if (block_in_bounds(orig_grid, orig_block_id, stego_w, stego_h, left_offset, top_offset)) {
+                uint8_t bit = extract_block(stego_data, stego_grid, channel, orig_block_id, left_offset, top_offset);
+                all_bits.push_back(bit);
+            } else {
+                all_bits.push_back(0);
+                out_erasure_bit_positions->push_back(bit_pos);
+            }
+            
+            if (all_bits.size() >= max_bits) return all_bits;
+        }
+    }
+    
+    return all_bits;
+}
+
+// ---------- 多簇辅助函数 ----------
+
+// 获取条带行范围
+void get_strip_range(int grid_rows, int num_clusters, int cluster_idx,
+                     int& start_row, int& end_row) {
+    int rows_per_strip = grid_rows / num_clusters;
+    start_row = cluster_idx * rows_per_strip;
+    if (cluster_idx == num_clusters - 1) {
+        end_row = grid_rows;
+    } else {
+        end_row = start_row + rows_per_strip;
+    }
+}
+
+// 在指定条带内嵌入 bits
+void embed_bits_to_strip(uint8_t* image_data,
+                          const BlockGrid& grid,
+                          const std::vector<uint8_t>& bits,
+                          uint64_t cluster_seed,
+                          bool has_alpha,
+                          int strip_start_row,
+                          int strip_end_row) {
+    int num_channels = 3;
+    size_t bits_written = 0;
+    
+    for (int ci = 0; ci < num_channels && bits_written < bits.size(); ci++) {
+        int channel = channel_for_index(ci, has_alpha);
+        if (channel < 0) break;
+        
+        // Collect blocks in strip [start_row, end_row)
+        size_t first_block = (size_t)strip_start_row * grid.grid_cols;
+        size_t last_block = (size_t)strip_end_row * grid.grid_cols;
+        size_t strip_block_count = last_block - first_block;
+        
+        if (strip_block_count == 0) continue;
+        
+        // PRNG shuffle within strip
+        auto block_order = shuffle_blocks(strip_block_count, cluster_seed * 1000 + ci);
+        
+        for (size_t bi = 0; bi < block_order.size() && bits_written < bits.size(); bi++) {
+            size_t orig_block_id = first_block + block_order[bi];
+            embed_block(image_data, grid, channel, orig_block_id,
+                       bits[bits_written], cluster_seed, bi);
+            bits_written++;
+        }
+    }
+}
+
+// 从指定条带提取 bits + 擦除信息
+std::vector<uint8_t> extract_bits_from_strip_with_erasures(
+    const uint8_t* stego_data,
+    const BlockGrid& grid,
+    uint32_t stego_w, uint32_t stego_h,
+    size_t max_bits,
+    uint64_t cluster_seed,
+    bool has_alpha,
+    int strip_start_row,
+    int strip_end_row,
+    std::vector<size_t>* out_erasure_positions,
+    int left_offset, int top_offset) {
+    
+    int num_channels = 3;
+    std::vector<uint8_t> all_bits;
+    all_bits.reserve(max_bits);
+    out_erasure_positions->clear();
+    
+    // stego_grid uses screenshot dimensions for pixel addressing
+    BlockGrid stego_grid = grid;
+    stego_grid.img_width = stego_w;
+    stego_grid.img_height = stego_h;
+    
+    for (int ci = 0; ci < num_channels; ci++) {
+        int channel = channel_for_index(ci, has_alpha);
+        if (channel < 0) break;
+        
+        size_t first_block = (size_t)strip_start_row * grid.grid_cols;
+        size_t last_block = (size_t)strip_end_row * grid.grid_cols;
+        size_t strip_block_count = last_block - first_block;
+        
+        if (strip_block_count == 0) continue;
+        
+        auto block_order = shuffle_blocks(strip_block_count, cluster_seed * 1000 + ci);
+        
+        for (size_t bi = 0; bi < block_order.size(); bi++) {
+            size_t bit_pos = all_bits.size();
+            size_t orig_block_id = first_block + block_order[bi];
+            
+            if (block_in_bounds(grid, orig_block_id, stego_w, stego_h, left_offset, top_offset)) {
+                uint8_t bit = extract_block(stego_data, stego_grid, channel, orig_block_id, left_offset, top_offset);
+                all_bits.push_back(bit);
+            } else {
+                all_bits.push_back(0);
+                out_erasure_positions->push_back(bit_pos);
+            }
+            
+            if (all_bits.size() >= max_bits) return all_bits;
+        }
+    }
+    
+    return all_bits;
+}
+
+// 字符串多数投票
+std::string majority_vote_text(const std::vector<std::string>& payloads) {
+    if (payloads.empty()) return "";
+    std::map<std::string, int> counts;
+    for (const auto& p : payloads) counts[p]++;
+    std::string best;
+    int best_count = 0;
+    for (const auto& kv : counts) {
+        if (kv.second > best_count) {
+            best = kv.first;
+            best_count = kv.second;
+        }
+    }
+    return best;
 }
 
 } // anonymous namespace
@@ -389,7 +588,8 @@ int channel_for_index(int idx, bool has_alpha) {
 EmbedResult embed_text(const std::string& input_png,
                        const std::string& output_png,
                        const std::string& text,
-                       uint64_t salt) {
+                       uint64_t salt,
+                       int ecc_level) {
     EmbedResult result;
     
     if (text.empty()) {
@@ -407,7 +607,7 @@ EmbedResult embed_text(const std::string& input_png,
     result.height = png.height;
     result.has_alpha = png.has_alpha;
     
-    int num_channels = 3;  // 始终只用 RGB 三通道
+    int num_channels = 3;
     auto grid = make_grid(png.width, png.height);
     size_t blocks_per_channel = grid.total_blocks();
     size_t total_blocks = blocks_per_channel * num_channels;
@@ -418,8 +618,46 @@ EmbedResult embed_text(const std::string& input_png,
         return result;
     }
     
-    auto payload = encode_text_payload(text);
-    auto bits = bytes_to_bits(payload);
+    std::vector<uint8_t> bits;
+    
+    if (ecc_level == 0) {
+        // 原始模式: 直接嵌入 [4字节长度][文本]
+        auto payload = encode_text_payload(text);
+        bits = bytes_to_bits(payload);
+    } else {
+        // ECC 模式: RS 编码
+        int npar = rs_codec::ecc_level_to_npar(ecc_level);
+        if (npar <= 0) {
+            result.error_msg = "invalid ecc_level";
+            return result;
+        }
+        
+        // 1. 构建 payload: [4字节text_len大端][text_bytes]
+        std::vector<uint8_t> payload;
+        uint32_t text_len = (uint32_t)text.size();
+        payload.resize(4);
+        write_u32_be(payload.data(), text_len);
+        payload.insert(payload.end(), text.begin(), text.end());
+        
+        // 2. RS 编码
+        auto ecc_data = rs_codec::rs_encode(payload, npar);
+        
+        // 3. 构建 header: ecc_data_length 的4字节大端，重复3次 = 12字节
+        uint32_t ecc_data_len = (uint32_t)ecc_data.size();
+        std::vector<uint8_t> header(12);
+        write_u32_be(&header[0], ecc_data_len);
+        write_u32_be(&header[4], ecc_data_len);
+        write_u32_be(&header[8], ecc_data_len);
+        
+        // 4. total_bytes = header + ecc_data
+        std::vector<uint8_t> total_bytes;
+        total_bytes.reserve(header.size() + ecc_data.size());
+        total_bytes.insert(total_bytes.end(), header.begin(), header.end());
+        total_bytes.insert(total_bytes.end(), ecc_data.begin(), ecc_data.end());
+        
+        // 5. 转为 bits
+        bits = bytes_to_bits(total_bytes);
+    }
     
     if (bits.size() > total_blocks) {
         result.error_msg = "text too large (" + std::to_string(bits.size()) + 
@@ -427,26 +665,7 @@ EmbedResult embed_text(const std::string& input_png,
         return result;
     }
     
-    // 跨通道嵌入
-    size_t bits_written = 0;
-    for (int ci = 0; ci < num_channels && bits_written < bits.size(); ci++) {
-        int channel = channel_for_index(ci, png.has_alpha);
-        if (channel < 0) break;
-        
-        auto block_order = shuffle_blocks(blocks_per_channel, salt * 1000 + ci);
-        
-        for (size_t bi = 0; bi < block_order.size() && bits_written < bits.size(); bi++) {
-            size_t orig_block_id = block_order[bi];
-            embed_block(png.data.data(), grid, channel, orig_block_id,
-                       bits[bits_written], salt, bi);
-            bits_written++;
-        }
-    }
-    
-    if (bits_written < bits.size()) {
-        result.error_msg = "failed to embed all bits";
-        return result;
-    }
+    embed_bits_to_image(png.data.data(), grid, bits, salt, png.has_alpha);
     
     if (!save_png_adaptive(output_png, png.data, png.width, png.height, !png.has_alpha)) {
         result.error_msg = "failed to save PNG: " + output_png;
@@ -454,12 +673,13 @@ EmbedResult embed_text(const std::string& input_png,
     }
     
     result.success = true;
-    result.used_bits = bits_written;
+    result.used_bits = bits.size();
     return result;
 }
 
 ExtractResult extract_text(const std::string& stego_png,
-                           uint64_t salt) {
+                           uint64_t salt,
+                           int ecc_level) {
     ExtractResult result;
     
     auto png = load_png_info(stego_png);
@@ -468,49 +688,296 @@ ExtractResult extract_text(const std::string& stego_png,
         return result;
     }
     
-    int num_channels = 3;
     auto grid = make_grid(png.width, png.height);
+    int num_channels = 3;
     size_t blocks_per_channel = grid.total_blocks();
+    size_t total_blocks = blocks_per_channel * num_channels;
     
-    std::vector<uint8_t> all_bits;
+    if (ecc_level == 0) {
+        // 原始模式: 提取 [4字节长度][文本]
+        // 先提取前32位获取长度
+        auto header_bits = extract_bits_from_image(png.data.data(), grid, 32, salt, png.has_alpha);
+        if (header_bits.size() < 32) {
+            result.error_msg = "not enough data for length header";
+            return result;
+        }
+        
+        auto header_bytes = bits_to_bytes(header_bits);
+        uint32_t text_len = read_u32_be(header_bytes.data());
+        size_t total_bits_needed = 32 + (size_t)text_len * 8;
+        
+        if (total_bits_needed > total_blocks) {
+            result.error_msg = "claimed text length exceeds image capacity";
+            return result;
+        }
+        
+        auto all_bits = extract_bits_from_image(png.data.data(), grid, total_bits_needed, salt, png.has_alpha);
+        auto all_bytes = bits_to_bytes(all_bits);
+        
+        if (!decode_text_payload(all_bytes.data(), all_bytes.size(), result.text)) {
+            result.error_msg = "failed to decode watermark (wrong salt?)";
+            return result;
+        }
+        
+        result.success = true;
+        return result;
+    }
     
-    for (int ci = 0; ci < num_channels; ci++) {
-        int channel = channel_for_index(ci, png.has_alpha);
-        if (channel < 0) break;
+    // ECC 模式
+    int npar = rs_codec::ecc_level_to_npar(ecc_level);
+    if (npar <= 0) {
+        result.error_msg = "invalid ecc_level";
+        return result;
+    }
+    
+    // 1. 先提取 12 字节 header (96 bits)
+    auto header_bits = extract_bits_from_image(png.data.data(), grid, 96, salt, png.has_alpha);
+    if (header_bits.size() < 96) {
+        result.error_msg = "not enough data for ECC header";
+        return result;
+    }
+    
+    auto header_bytes = bits_to_bytes(header_bits);
+    
+    // 2. 对3份4字节做多数投票得到 ecc_data_len
+    uint32_t len1 = read_u32_be(&header_bytes[0]);
+    uint32_t len2 = read_u32_be(&header_bytes[4]);
+    uint32_t len3 = read_u32_be(&header_bytes[8]);
+    
+    uint32_t ecc_data_len;
+    if (len1 == len2 || len1 == len3) {
+        ecc_data_len = len1;
+    } else if (len2 == len3) {
+        ecc_data_len = len2;
+    } else {
+        // 三者都不同，取第一个（无法投票）
+        ecc_data_len = len1;
+    }
+    
+    // 合理性检查
+    if (ecc_data_len == 0 || ecc_data_len % 255 != 0) {
+        result.error_msg = "invalid ECC data length (not multiple of 255)";
+        return result;
+    }
+    
+    // 3. 提取完整数据: 12字节 header + ecc_data_len 字节
+    size_t total_bytes_needed = 12 + ecc_data_len;
+    size_t total_bits_needed = total_bytes_needed * 8;
+    
+    if (total_bits_needed > total_blocks) {
+        result.error_msg = "ECC data exceeds image capacity";
+        return result;
+    }
+    
+    auto all_bits = extract_bits_from_image(png.data.data(), grid, total_bits_needed, salt, png.has_alpha);
+    auto all_bytes = bits_to_bytes(all_bits);
+    
+    // 4. 提取 ecc_data (跳过12字节 header)
+    if (all_bytes.size() < total_bytes_needed) {
+        result.error_msg = "not enough data extracted";
+        return result;
+    }
+    
+    std::vector<uint8_t> ecc_data(all_bytes.begin() + 12, all_bytes.begin() + 12 + ecc_data_len);
+    
+    // 5. RS 解码
+    auto payload = rs_codec::rs_decode(ecc_data, npar);
+    if (payload.empty()) {
+        result.error_msg = "RS decode failed (too many errors)";
+        return result;
+    }
+    
+    // 6. 解析 payload: [4字节text_len][text_bytes]
+    if (payload.size() < 4) {
+        result.error_msg = "decoded payload too short";
+        return result;
+    }
+    
+    uint32_t text_len = read_u32_be(payload.data());
+    if (4 + (size_t)text_len > payload.size()) {
+        result.error_msg = "text length mismatch in decoded payload";
+        return result;
+    }
+    
+    result.text.assign((const char*)(payload.data() + 4), text_len);
+    result.success = true;
+    return result;
+}
+
+ExtractResult extract_text_with_erasures(const std::string& stego_png,
+                                          uint64_t salt,
+                                          int ecc_level,
+                                          uint32_t orig_width,
+                                          uint32_t orig_height) {
+    ExtractResult result;
+    
+    auto png = load_png_info(stego_png);
+    if (png.width == 0) {
+        result.error_msg = "failed to load PNG: " + stego_png;
+        return result;
+    }
+    
+    auto orig_grid = make_grid(orig_width, orig_height);
+    int num_channels = 3;
+    size_t blocks_per_channel = orig_grid.total_blocks();
+    size_t total_blocks = blocks_per_channel * num_channels;
+    
+    int npar = rs_codec::ecc_level_to_npar(ecc_level);
+    if (npar <= 0) {
+        result.error_msg = "erasure extraction requires ECC level >= 1";
+        return result;
+    }
+    
+    // Calculate possible crop offset ranges
+    int max_left_offset = (orig_width > png.width) ? (int)(orig_width - png.width) : 0;
+    int max_top_offset = (orig_height > png.height) ? (int)(orig_height - png.height) : 0;
+    
+    // Lambda: try extraction at a specific offset
+    auto try_extract = [&](int lo, int to) -> ExtractResult {
+        ExtractResult r;
         
-        auto block_order = shuffle_blocks(blocks_per_channel, salt * 1000 + ci);
+        // 1. Extract 96 bits header with erasure info
+        std::vector<size_t> header_erasure_positions;
+        auto header_bits = extract_bits_with_erasures(
+            png.data.data(), orig_grid, png.width, png.height,
+            96, salt, png.has_alpha, &header_erasure_positions, lo, to);
         
-        for (size_t bi = 0; bi < block_order.size(); bi++) {
-            size_t orig_block_id = block_order[bi];
-            uint8_t bit = extract_block(png.data.data(), grid, channel, orig_block_id);
-            all_bits.push_back(bit);
-            
-            // 读够 32 bit 后解析长度
-            if (all_bits.size() >= 32 && (all_bits.size() % 8 == 0)) {
-                auto header_bytes = bits_to_bytes(all_bits);
-                uint32_t text_len = ((uint32_t)header_bytes[0] << 24) |
-                                    ((uint32_t)header_bytes[1] << 16) |
-                                    ((uint32_t)header_bytes[2] <<  8) |
-                                     (uint32_t)header_bytes[3];
-                size_t total_bits_needed = 32 + (size_t)text_len * 8;
-                if (all_bits.size() >= total_bits_needed) goto done_reading;
+        if (header_bits.size() < 96) {
+            r.error_msg = "not enough data for ECC header";
+            return r;
+        }
+        
+        std::vector<size_t> era_set(header_erasure_positions.begin(), header_erasure_positions.end());
+        std::sort(era_set.begin(), era_set.end());
+        
+        auto is_erased = [&era_set](size_t pos) -> bool {
+            return std::binary_search(era_set.begin(), era_set.end(), pos);
+        };
+        
+        std::vector<uint8_t> voted_header_bytes(12, 0);
+        for (int bit_offset = 0; bit_offset < 32; bit_offset++) {
+            int votes[2] = {0, 0};
+            for (int copy = 0; copy < 3; copy++) {
+                size_t pos = (size_t)(copy * 32 + bit_offset);
+                if (!is_erased(pos)) {
+                    votes[header_bits[pos]]++;
+                }
+            }
+            uint8_t voted_bit = (votes[1] > votes[0]) ? 1 : 0;
+            int total_votes = votes[0] + votes[1];
+            if (total_votes > 0) {
+                for (int copy = 0; copy < 3; copy++) {
+                    int byte_idx = copy * 4 + bit_offset / 8;
+                    int bit_in_byte = 7 - (bit_offset % 8);
+                    voted_header_bytes[byte_idx] |= (voted_bit << bit_in_byte);
+                }
+            }
+        }
+        
+        auto header_bytes_raw = bits_to_bytes(header_bits);
+        auto header_bytes = voted_header_bytes;
+        
+        uint32_t len1 = read_u32_be(&header_bytes[0]);
+        uint32_t len2 = read_u32_be(&header_bytes[4]);
+        uint32_t len3 = read_u32_be(&header_bytes[8]);
+        
+        uint32_t ecc_data_len;
+        if (len1 == len2 || len1 == len3) ecc_data_len = len1;
+        else if (len2 == len3) ecc_data_len = len2;
+        else {
+            len1 = read_u32_be(&header_bytes_raw[0]);
+            len2 = read_u32_be(&header_bytes_raw[4]);
+            len3 = read_u32_be(&header_bytes_raw[8]);
+            if (len1 == len2 || len1 == len3) ecc_data_len = len1;
+            else if (len2 == len3) ecc_data_len = len2;
+            else ecc_data_len = len1;
+        }
+        
+        if (ecc_data_len == 0 || ecc_data_len % 255 != 0) {
+            size_t max_possible_bytes = total_blocks * 3 / 8;
+            uint32_t best_len = 0;
+            uint32_t min_diff = 0xFFFFFFFF;
+            for (uint32_t candidate = 255; candidate <= max_possible_bytes && candidate < 100000; candidate += 255) {
+                uint32_t diff = (candidate > ecc_data_len) ? (candidate - ecc_data_len) : (ecc_data_len - candidate);
+                if (diff < min_diff) { min_diff = diff; best_len = candidate; }
+            }
+            if (best_len > 0 && min_diff < 255) ecc_data_len = best_len;
+            else { r.error_msg = "invalid header"; return r; }
+        }
+        
+        // 3. Extract full data
+        size_t total_bytes_needed = 12 + ecc_data_len;
+        size_t total_bits_needed = total_bytes_needed * 8;
+        
+        if (total_bits_needed > total_blocks) {
+            r.error_msg = "ECC data exceeds capacity";
+            return r;
+        }
+        
+        std::vector<size_t> all_erasure_bit_positions;
+        auto all_bits = extract_bits_with_erasures(
+            png.data.data(), orig_grid, png.width, png.height,
+            total_bits_needed, salt, png.has_alpha, &all_erasure_bit_positions, lo, to);
+        
+        auto all_bytes = bits_to_bytes(all_bits);
+        if (all_bytes.size() < total_bytes_needed) {
+            r.error_msg = "not enough data";
+            return r;
+        }
+        
+        std::vector<uint8_t> ecc_data(all_bytes.begin() + 12, all_bytes.begin() + 12 + ecc_data_len);
+        
+        // 4. Bit-level erasures -> RS symbol-level erasures
+        size_t num_rs_blocks = ecc_data_len / 255;
+        std::vector<std::vector<int>> erasures_per_block(num_rs_blocks);
+        
+        for (size_t bit_pos : all_erasure_bit_positions) {
+            if (bit_pos < 96) continue;
+            size_t byte_offset = (bit_pos - 96) / 8;
+            size_t rs_block_idx = byte_offset / 255;
+            int symbol_idx = (int)(byte_offset % 255);
+            if (rs_block_idx < num_rs_blocks) {
+                auto& evec = erasures_per_block[rs_block_idx];
+                if (std::find(evec.begin(), evec.end(), symbol_idx) == evec.end())
+                    evec.push_back(symbol_idx);
+            }
+        }
+        
+        // 5. RS decode
+        auto payload = rs_codec::rs_decode_with_erasures(ecc_data, npar, erasures_per_block);
+        if (payload.empty()) {
+            r.error_msg = "RS decode failed";
+            return r;
+        }
+        
+        // 6. Parse payload
+        if (payload.size() < 4) { r.error_msg = "payload too short"; return r; }
+        uint32_t text_len = read_u32_be(payload.data());
+        if (4 + (size_t)text_len > payload.size()) { r.error_msg = "text len mismatch"; return r; }
+        
+        r.text.assign((const char*)(payload.data() + 4), text_len);
+        r.success = true;
+        return r;
+    };
+    
+    // Scan all possible crop offsets
+    for (int to = 0; to <= max_top_offset; to++) {
+        for (int lo = 0; lo <= max_left_offset; lo++) {
+            auto r = try_extract(lo, to);
+            if (r.success) {
+                if (max_top_offset > 0 || max_left_offset > 0) {
+                    std::cout << "  [INFO] Found at offset (left=" << lo << ", top=" << to << ")\n";
+                }
+                return r;
             }
         }
     }
     
-done_reading:
-    if (all_bits.size() < 32) {
-        result.error_msg = "not enough data for length header";
-        return result;
-    }
-    
-    auto all_bytes = bits_to_bytes(all_bits);
-    if (!decode_text_payload(all_bytes.data(), all_bytes.size(), result.text)) {
-        result.error_msg = "failed to decode watermark (wrong salt?)";
-        return result;
-    }
-    
-    result.success = true;
+    int total_offsets = (max_top_offset + 1) * (max_left_offset + 1);
+    result.error_msg = "failed across " + std::to_string(total_offsets) + 
+                      " crop offsets (top: 0-" + std::to_string(max_top_offset) + 
+                      ", left: 0-" + std::to_string(max_left_offset) + 
+                      "). Try multicluster mode for better recovery.";
     return result;
 }
 
@@ -531,6 +998,390 @@ CapacityInfo get_capacity(const std::string& png_path) {
     
     size_t total_blocks = info.blocks_per_channel * info.available_channels;
     size_t data_bits = total_blocks > 32 ? total_blocks - 32 : 0;
+    info.max_text_bytes = data_bits / 8;
+    info.max_text_chars = info.max_text_bytes / 3;
+    
+    return info;
+}
+
+// ========================================================================
+// 多簇冗余 API (v2.0)
+// ========================================================================
+
+EmbedResult embed_text_multicluster(const std::string& input_png,
+                                      const std::string& output_png,
+                                      const std::string& text,
+                                      uint64_t salt,
+                                      int ecc_level,
+                                      int num_clusters) {
+    EmbedResult result;
+    
+    if (text.empty()) {
+        result.error_msg = "watermark text is empty";
+        return result;
+    }
+    if (num_clusters < 1) num_clusters = 1;
+    if (ecc_level < 1) ecc_level = 1; // multicluster requires ECC
+    
+    auto png = load_png_info(input_png);
+    if (png.width == 0) {
+        result.error_msg = "failed to load PNG: " + input_png;
+        return result;
+    }
+    
+    result.width = png.width;
+    result.height = png.height;
+    result.has_alpha = png.has_alpha;
+    
+    auto grid = make_grid(png.width, png.height);
+    int num_channels = 3;
+    
+    if (grid.total_blocks() == 0 || grid.grid_rows < (uint32_t)num_clusters) {
+        result.error_msg = "image too small for " + std::to_string(num_clusters) + " clusters";
+        return result;
+    }
+    
+    // Build RS-encoded data
+    int npar = rs_codec::ecc_level_to_npar(ecc_level);
+    
+    std::vector<uint8_t> payload;
+    uint32_t text_len = (uint32_t)text.size();
+    payload.resize(4);
+    write_u32_be(payload.data(), text_len);
+    payload.insert(payload.end(), text.begin(), text.end());
+    
+    auto ecc_data = rs_codec::rs_encode(payload, npar);
+    uint32_t ecc_data_len = (uint32_t)ecc_data.size();
+    
+    // Header: 3 copies of ecc_data_len = 12 bytes
+    std::vector<uint8_t> header(12);
+    write_u32_be(&header[0], ecc_data_len);
+    write_u32_be(&header[4], ecc_data_len);
+    write_u32_be(&header[8], ecc_data_len);
+    
+    // Cluster data = header + ecc_data
+    std::vector<uint8_t> cluster_data;
+    cluster_data.reserve(header.size() + ecc_data.size());
+    cluster_data.insert(cluster_data.end(), header.begin(), header.end());
+    cluster_data.insert(cluster_data.end(), ecc_data.begin(), ecc_data.end());
+    
+    auto bits = bytes_to_bits(cluster_data);
+    
+    // Check capacity per cluster (minimum strip determines limit)
+    int strip_start, strip_end;
+    get_strip_range(grid.grid_rows, num_clusters, 0, strip_start, strip_end);
+    size_t min_strip_blocks = ((size_t)(strip_end - strip_start)) * grid.grid_cols;
+    size_t min_strip_capacity = min_strip_blocks * num_channels;
+    
+    if (bits.size() > min_strip_capacity) {
+        result.error_msg = "text too large for multicluster (" + 
+                          std::to_string(bits.size()) + " bits needed per cluster, " +
+                          std::to_string(min_strip_capacity) + " bits available in smallest strip)";
+        return result;
+    }
+    
+    result.capacity_bits = min_strip_capacity;
+    
+    // Embed into each cluster strip
+    for (int c = 0; c < num_clusters; c++) {
+        get_strip_range(grid.grid_rows, num_clusters, c, strip_start, strip_end);
+        uint64_t cluster_seed = salt * 10000 + c;
+        
+        embed_bits_to_strip(png.data.data(), grid, bits, cluster_seed,
+                           png.has_alpha, strip_start, strip_end);
+    }
+    
+    result.used_bits = bits.size() * num_clusters;
+    
+    if (!save_png_adaptive(output_png, png.data, png.width, png.height, !png.has_alpha)) {
+        result.error_msg = "failed to save PNG: " + output_png;
+        return result;
+    }
+    
+    result.success = true;
+    return result;
+}
+
+ExtractResult extract_text_multicluster(const std::string& stego_png,
+                                          uint64_t salt,
+                                          int ecc_level,
+                                          int num_clusters,
+                                          uint32_t orig_width,
+                                          uint32_t orig_height) {
+    ExtractResult result;
+    
+    if (num_clusters < 1) num_clusters = 1;
+    if (ecc_level < 1) {
+        result.error_msg = "multicluster extraction requires ECC level >= 1";
+        return result;
+    }
+    
+    auto png = load_png_info(stego_png);
+    if (png.width == 0) {
+        result.error_msg = "failed to load PNG: " + stego_png;
+        return result;
+    }
+    
+    auto orig_grid = make_grid(orig_width, orig_height);
+    int npar = rs_codec::ecc_level_to_npar(ecc_level);
+    if (npar <= 0) {
+        result.error_msg = "invalid ecc_level";
+        return result;
+    }
+    
+    // Calculate possible crop offset ranges
+    // The screenshot is assumed to be a crop of the original image
+    // We need to try all possible (left_offset, top_offset) values
+    int max_left_offset = (orig_width > png.width) ? (int)(orig_width - png.width) : 0;
+    int max_top_offset = (orig_height > png.height) ? (int)(orig_height - png.height) : 0;
+    
+    // Lambda: try decoding one cluster at a given offset
+    // Returns decoded text, or empty string on failure
+    auto try_cluster = [&](int c, int lo, int to) -> std::string {
+        int strip_start, strip_end;
+        get_strip_range(orig_grid.grid_rows, num_clusters, c, strip_start, strip_end);
+        if (strip_start >= strip_end) return "";
+        
+        uint64_t cluster_seed = salt * 10000 + c;
+        
+        // 1. Extract 96-bit header with erasures
+        std::vector<size_t> header_erasures;
+        auto header_bits = extract_bits_from_strip_with_erasures(
+            png.data.data(), orig_grid, png.width, png.height,
+            96, cluster_seed, png.has_alpha,
+            strip_start, strip_end, &header_erasures, lo, to);
+        
+        if (header_bits.size() < 96) return "";
+        
+        // 2. Parse header with bit-level majority voting across 3 copies
+        std::vector<size_t> era_set = header_erasures;
+        std::sort(era_set.begin(), era_set.end());
+        
+        auto is_erased = [&era_set](size_t pos) -> bool {
+            return std::binary_search(era_set.begin(), era_set.end(), pos);
+        };
+        
+        std::vector<uint8_t> voted_bytes(12, 0);
+        for (int bit_offset = 0; bit_offset < 32; bit_offset++) {
+            int votes[2] = {0, 0};
+            for (int copy = 0; copy < 3; copy++) {
+                size_t pos = (size_t)(copy * 32 + bit_offset);
+                if (!is_erased(pos)) {
+                    votes[header_bits[pos]]++;
+                }
+            }
+            uint8_t voted_bit = (votes[1] > votes[0]) ? 1 : 0;
+            int total_votes = votes[0] + votes[1];
+            if (total_votes > 0) {
+                for (int copy = 0; copy < 3; copy++) {
+                    int byte_idx = copy * 4 + bit_offset / 8;
+                    int bit_in_byte = 7 - (bit_offset % 8);
+                    voted_bytes[byte_idx] |= (voted_bit << bit_in_byte);
+                }
+            }
+        }
+        
+        uint32_t len1 = read_u32_be(&voted_bytes[0]);
+        uint32_t len2 = read_u32_be(&voted_bytes[4]);
+        uint32_t len3 = read_u32_be(&voted_bytes[8]);
+        
+        uint32_t ecc_data_len;
+        if (len1 == len2 || len1 == len3) ecc_data_len = len1;
+        else if (len2 == len3) ecc_data_len = len2;
+        else ecc_data_len = len1;
+        
+        if (ecc_data_len == 0 || ecc_data_len % 255 != 0) {
+            uint32_t best = 255;
+            uint32_t min_diff = 0xFFFFFFFF;
+            for (uint32_t cand = 255; cand <= 65535; cand += 255) {
+                uint32_t d = (cand > ecc_data_len) ? (cand - ecc_data_len) : (ecc_data_len - cand);
+                if (d < min_diff) { min_diff = d; best = cand; }
+            }
+            if (min_diff < 255) ecc_data_len = best;
+            else return "";
+        }
+        
+        // 3. Extract full data with erasures
+        size_t total_bytes_needed = 12 + ecc_data_len;
+        size_t total_bits_needed = total_bytes_needed * 8;
+        
+        std::vector<size_t> all_erasures;
+        auto all_bits = extract_bits_from_strip_with_erasures(
+            png.data.data(), orig_grid, png.width, png.height,
+            total_bits_needed, cluster_seed, png.has_alpha,
+            strip_start, strip_end, &all_erasures, lo, to);
+        
+        if (all_bits.size() < total_bits_needed) return "";
+        
+        auto all_bytes = bits_to_bytes(all_bits);
+        if (all_bytes.size() < total_bytes_needed) return "";
+        
+        std::vector<uint8_t> ecc_data(all_bytes.begin() + 12,
+                                       all_bytes.begin() + 12 + ecc_data_len);
+        
+        // 4. Convert bit-level erasures to RS symbol-level erasures
+        size_t num_rs_blocks = ecc_data_len / 255;
+        std::vector<std::vector<int>> erasures_per_block(num_rs_blocks);
+        
+        for (size_t bit_pos : all_erasures) {
+            if (bit_pos < 96) continue;
+            size_t byte_offset = (bit_pos - 96) / 8;
+            size_t rs_block_idx = byte_offset / 255;
+            int symbol_idx = (int)(byte_offset % 255);
+            if (rs_block_idx < num_rs_blocks) {
+                auto& evec = erasures_per_block[rs_block_idx];
+                if (std::find(evec.begin(), evec.end(), symbol_idx) == evec.end()) {
+                    evec.push_back(symbol_idx);
+                }
+            }
+        }
+        
+        // 5. RS decode
+        auto payload = rs_codec::rs_decode_with_erasures(ecc_data, npar, erasures_per_block);
+        if (payload.empty()) {
+            payload = rs_codec::rs_decode(ecc_data, npar);
+        }
+        if (payload.empty()) return "";
+        
+        // 6. Parse payload
+        if (payload.size() < 4) return "";
+        uint32_t decoded_text_len = read_u32_be(payload.data());
+        if (4 + (size_t)decoded_text_len > payload.size()) return "";
+        
+        return std::string((const char*)(payload.data() + 4), decoded_text_len);
+    };
+    
+    // Scan all possible crop offsets
+    std::vector<std::string> success_payloads;
+    int best_lo = 0, best_to = 0;
+    
+    for (int to = 0; to <= max_top_offset; to++) {
+        for (int lo = 0; lo <= max_left_offset; lo++) {
+            // Quick scan: try header-only check on first cluster to filter offsets fast
+            // If the dimensions match (no crop), just try normally
+            bool any_offset = (max_top_offset > 0 || max_left_offset > 0);
+            
+            if (any_offset) {
+                // Fast header check: extract 96 bits from cluster 0 with this offset
+                int strip_start, strip_end;
+                get_strip_range(orig_grid.grid_rows, num_clusters, 0, strip_start, strip_end);
+                if (strip_start >= strip_end) continue;
+                
+                uint64_t cluster_seed = salt * 10000 + 0;
+                std::vector<size_t> quick_erasures;
+                auto quick_bits = extract_bits_from_strip_with_erasures(
+                    png.data.data(), orig_grid, png.width, png.height,
+                    96, cluster_seed, png.has_alpha,
+                    strip_start, strip_end, &quick_erasures, lo, to);
+                
+                if (quick_bits.size() < 96) continue;
+                
+                // Quick header validation
+                int erased_count = 0;
+                for (size_t pos : quick_erasures) {
+                    if (pos < 96) erased_count++;
+                }
+                // If more than 60 header bits are erased, this offset is unlikely
+                if (erased_count > 60) continue;
+                
+                // Check if header parses to a valid length
+                std::vector<size_t> era_set(quick_erasures.begin(), quick_erasures.end());
+                std::sort(era_set.begin(), era_set.end());
+                auto is_era = [&era_set](size_t pos) -> bool {
+                    return std::binary_search(era_set.begin(), era_set.end(), pos);
+                };
+                
+                std::vector<uint8_t> qb(12, 0);
+                for (int bo = 0; bo < 32; bo++) {
+                    int vt[2] = {0, 0};
+                    for (int cp = 0; cp < 3; cp++) {
+                        size_t pos = (size_t)(cp * 32 + bo);
+                        if (!is_era(pos)) vt[quick_bits[pos]]++;
+                    }
+                    uint8_t vb = (vt[1] > vt[0]) ? 1 : 0;
+                    if (vt[0] + vt[1] > 0) {
+                        for (int cp = 0; cp < 3; cp++) {
+                            qb[cp * 4 + bo / 8] |= (vb << (7 - (bo % 8)));
+                        }
+                    }
+                }
+                uint32_t ql = read_u32_be(&qb[0]);
+                if (ql == 0 || ql % 255 != 0) {
+                    // Check if it's close to a valid value
+                    bool close = false;
+                    for (uint32_t cand = 255; cand <= 65535; cand += 255) {
+                        if (cand > ql && cand - ql < 255) { close = true; break; }
+                        if (ql > cand && ql - cand < 255) { close = true; break; }
+                        if (cand == ql) { close = true; break; }
+                    }
+                    if (!close) continue;
+                }
+            }
+            
+            // Full decode: try all clusters at this offset
+            bool found_at_offset = false;
+            for (int c = 0; c < num_clusters; c++) {
+                auto text = try_cluster(c, lo, to);
+                if (!text.empty()) {
+                    success_payloads.push_back(text);
+                    best_lo = lo;
+                    best_to = to;
+                    found_at_offset = true;
+                }
+            }
+            
+            // If we found results at this offset, no need to try more offsets
+            if (found_at_offset) {
+                goto done_scanning;
+            }
+        }
+    }
+    done_scanning:
+    
+    if (success_payloads.empty()) {
+        int total_offsets = (max_top_offset + 1) * (max_left_offset + 1);
+        result.error_msg = "all clusters failed across " + std::to_string(total_offsets) + 
+                          " crop offsets (top: 0-" + std::to_string(max_top_offset) + 
+                          ", left: 0-" + std::to_string(max_left_offset) + ")";
+        return result;
+    }
+    
+    if (max_top_offset > 0 || max_left_offset > 0) {
+        std::cout << "  [INFO] Found at offset (left=" << best_lo << ", top=" << best_to << ")\n";
+    }
+    
+    // Majority vote
+    result.text = majority_vote_text(success_payloads);
+    result.success = true;
+    return result;
+}
+
+CapacityInfo get_capacity_multicluster(const std::string& png_path, int num_clusters) {
+    CapacityInfo info;
+    
+    auto png = load_png_info(png_path);
+    if (png.width == 0) return info;
+    
+    info.width = png.width;
+    info.height = png.height;
+    info.has_alpha = png.has_alpha;
+    info.total_pixels = (size_t)png.width * png.height;
+    info.available_channels = 3;
+    
+    auto grid = make_grid(png.width, png.height);
+    
+    if (num_clusters < 1) num_clusters = 1;
+    
+    // Per-cluster capacity = minimum strip size
+    int strip_start, strip_end;
+    get_strip_range(grid.grid_rows, num_clusters, 0, strip_start, strip_end);
+    size_t min_strip_blocks = ((size_t)(strip_end - strip_start)) * grid.grid_cols;
+    
+    info.blocks_per_channel = min_strip_blocks;
+    
+    size_t total_bits = min_strip_blocks * info.available_channels;
+    // Header takes 96 bits
+    size_t data_bits = total_bits > 96 ? total_bits - 96 : 0;
     info.max_text_bytes = data_bits / 8;
     info.max_text_chars = info.max_text_bytes / 3;
     
