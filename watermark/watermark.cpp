@@ -814,6 +814,133 @@ std::vector<uint8_t> extract_bits_from_strip_extension(
     return all_bits;
 }
 
+// ========== 统一偏移提取函数（支持正负偏移）==========
+// 用于「裁剪+拓展回原大小」场景，pixel_shift 表示原图内容在新图中的像素偏移
+// 即：原图(gx*3+1, gy*3+1)处的像素，在新图位于(gx*3+1+dx, gy*3+1+dy)
+
+bool block_in_bounds_shifted(size_t orig_block_id, uint32_t orig_grid_cols,
+                              uint32_t img_w, uint32_t img_h,
+                              int dx, int dy) {
+    size_t gr = orig_block_id / orig_grid_cols;
+    size_t gc = orig_block_id % orig_grid_cols;
+    int px = (int)(gc * 3 + 1) + dx;
+    int py = (int)(gr * 3 + 1) + dy;
+    return (px >= 0) && ((size_t)px < img_w) &&
+           (py >= 0) && ((size_t)py < img_h);
+}
+
+uint8_t extract_block_shifted(const uint8_t* stego_data,
+                               uint32_t img_w,
+                               size_t orig_block_id,
+                               uint32_t orig_grid_cols,
+                               int channel,
+                               int dx, int dy) {
+    size_t gr = orig_block_id / orig_grid_cols;
+    size_t gc = orig_block_id % orig_grid_cols;
+    int cx = (int)(gc * 3 + 1) + dx;
+    int cy = (int)(gr * 3 + 1) + dy;
+    size_t pixel_idx = (size_t)cy * img_w + (size_t)cx;
+    return stego_data[pixel_idx * 4 + channel] & 1;
+}
+
+// 单元级提取（统一偏移模式，支持正负偏移）
+std::vector<uint8_t> extract_bits_cell_major_shifted(
+    const uint8_t* stego_data,
+    const BlockGrid& orig_grid,
+    uint32_t img_w, uint32_t img_h,
+    size_t max_bits,
+    uint64_t salt,
+    bool has_alpha,
+    std::vector<size_t>* out_erasure_bit_positions,
+    int dx, int dy) {
+
+    size_t cell_cols = orig_grid.grid_cols / 3;
+    size_t total_cells = cell_cols * orig_grid.grid_rows;
+    std::vector<uint8_t> all_bits;
+    all_bits.reserve(max_bits);
+    out_erasure_bit_positions->clear();
+
+    if (total_cells == 0) return all_bits;
+
+    auto cell_order = shuffle_blocks(total_cells, salt);
+
+    for (size_t ci = 0; ci < cell_order.size() && all_bits.size() < max_bits; ci++) {
+        size_t cell_id = cell_order[ci];
+        size_t cell_row = cell_id / cell_cols;
+        size_t cell_col = cell_id % cell_cols;
+
+        for (int k = 0; k < 3 && all_bits.size() < max_bits; k++) {
+            size_t block_col = cell_col * 3 + k;
+            if (block_col >= orig_grid.grid_cols) break;
+            size_t block_id = cell_row * orig_grid.grid_cols + block_col;
+
+            for (int ch = 0; ch < 3 && all_bits.size() < max_bits; ch++) {
+                if (k == 2 && ch == 2) break;
+                int channel = channel_for_index(ch, has_alpha);
+                size_t bit_pos = all_bits.size();
+
+                if (block_in_bounds_shifted(block_id, orig_grid.grid_cols, img_w, img_h, dx, dy)) {
+                    uint8_t bit = extract_block_shifted(stego_data, img_w, block_id, orig_grid.grid_cols, channel, dx, dy);
+                    all_bits.push_back(bit);
+                } else {
+                    all_bits.push_back(0);
+                    out_erasure_bit_positions->push_back(bit_pos);
+                }
+            }
+        }
+    }
+
+    return all_bits;
+}
+
+// 从指定条带提取 bits（统一偏移模式）
+std::vector<uint8_t> extract_bits_from_strip_shifted(
+    const uint8_t* stego_data,
+    const BlockGrid& orig_grid,
+    uint32_t img_w, uint32_t img_h,
+    size_t max_bits,
+    uint64_t cluster_seed,
+    bool has_alpha,
+    int strip_start_row, int strip_end_row,
+    std::vector<size_t>* out_erasure_positions,
+    int dx, int dy) {
+
+    int num_channels = 3;
+    std::vector<uint8_t> all_bits;
+    all_bits.reserve(max_bits);
+    out_erasure_positions->clear();
+
+    for (int ci = 0; ci < num_channels; ci++) {
+        int channel = channel_for_index(ci, has_alpha);
+        if (channel < 0) break;
+
+        size_t first_block = (size_t)strip_start_row * orig_grid.grid_cols;
+        size_t last_block = (size_t)strip_end_row * orig_grid.grid_cols;
+        size_t strip_block_count = last_block - first_block;
+
+        if (strip_block_count == 0) continue;
+
+        auto block_order = shuffle_blocks(strip_block_count, cluster_seed * 1000 + ci);
+
+        for (size_t bi = 0; bi < block_order.size(); bi++) {
+            size_t bit_pos = all_bits.size();
+            size_t orig_block_id = first_block + block_order[bi];
+
+            if (block_in_bounds_shifted(orig_block_id, orig_grid.grid_cols, img_w, img_h, dx, dy)) {
+                uint8_t bit = extract_block_shifted(stego_data, img_w, orig_block_id, orig_grid.grid_cols, channel, dx, dy);
+                all_bits.push_back(bit);
+            } else {
+                all_bits.push_back(0);
+                out_erasure_positions->push_back(bit_pos);
+            }
+
+            if (all_bits.size() >= max_bits) return all_bits;
+        }
+    }
+
+    return all_bits;
+}
+
 // 从提取的bits解码ECC payload（共享逻辑，避免重复代码）
 ExtractResult decode_ecc_payload(
     const std::vector<uint8_t>& all_bits,
@@ -920,7 +1047,9 @@ ExtractResult decode_ecc_payload(
     // 6. Parse payload
     if (payload.size() < 4) { r.error_msg = "payload too short"; return r; }
     uint32_t text_len = read_u32_be(payload.data());
+    if (text_len == 0) { r.error_msg = "empty text"; return r; }
     if (4 + (size_t)text_len > payload.size()) { r.error_msg = "text len mismatch"; return r; }
+    if (text_len > 10000) { r.error_msg = "text too long"; return r; }
 
     r.text.assign((const char*)(payload.data() + 4), text_len);
     r.success = true;
@@ -1194,19 +1323,63 @@ ExtractResult extract_text_with_erasures(const std::string& stego_png,
         return result;
     }
     
-    // Calculate possible crop offset ranges
-    int max_left_offset = (orig_width > png.width) ? (int)(orig_width - png.width) : 0;
-    int max_top_offset = (orig_height > png.height) ? (int)(orig_height - png.height) : 0;
+    // Calculate possible shift ranges
+    // shift dx means: original pixel at (gx*3+1, gy*3+1) is now at (gx*3+1+dx, gy*3+1+dy)
+    // Crop case (image smaller): dx ranges from -(orig_w - img_w) to 0
+    // Extend case (image bigger): dx ranges from 0 to (img_w - orig_w)
+    // Same size with crop+extend: dx can be negative or positive
+    int min_dx, max_dx, min_dy, max_dy;
     
-    // Lambda: try extraction at a specific offset
-    auto try_extract = [&](int lo, int to) -> ExtractResult {
+    if (png.width >= orig_width) {
+        min_dx = 0;
+        max_dx = (int)(png.width - orig_width);
+    } else {
+        min_dx = -(int)(orig_width - png.width);
+        max_dx = 0;
+    }
+    if (png.height >= orig_height) {
+        min_dy = 0;
+        max_dy = (int)(png.height - orig_height);
+    } else {
+        min_dy = -(int)(orig_height - png.height);
+        max_dy = 0;
+    }
+    
+    // Also consider crop+extend-back-to-same-size scenario
+    // In this case, image could be same size but content shifted
+    // We need to search both positive and negative shifts
+    // Expand range if same size (content could have shifted either direction)
+    if (png.width == orig_width) {
+        // Could be no shift, or crop+extend that cancelled out
+        // We don't know the shift amount, so search a reasonable range
+        const int MAX_SHIFT = 200;
+        min_dx = -MAX_SHIFT;
+        max_dx = MAX_SHIFT;
+    }
+    if (png.height == orig_height) {
+        const int MAX_SHIFT = 200;
+        min_dy = -MAX_SHIFT;
+        max_dy = MAX_SHIFT;
+    }
+    
+    // Cap search range for performance
+    const int MAX_SHIFT_CAP = 200;
+    if (min_dx < -MAX_SHIFT_CAP) min_dx = -MAX_SHIFT_CAP;
+    if (max_dx > MAX_SHIFT_CAP) max_dx = MAX_SHIFT_CAP;
+    if (min_dy < -MAX_SHIFT_CAP) min_dy = -MAX_SHIFT_CAP;
+    if (max_dy > MAX_SHIFT_CAP) max_dy = MAX_SHIFT_CAP;
+    
+    const int MAX_OFFSET_ITERATIONS = 10000;
+    
+    // Lambda: try extraction at a specific shift
+    auto try_extract = [&](int dx, int dy) -> ExtractResult {
         ExtractResult r;
         
         // 1. Extract 96 bits header with erasure info (column-major)
         std::vector<size_t> header_erasure_positions;
-        auto header_bits = extract_bits_cell_major_with_erasures(
+        auto header_bits = extract_bits_cell_major_shifted(
             png.data.data(), orig_grid, png.width, png.height,
-            96, salt, png.has_alpha, &header_erasure_positions, lo, to);
+            96, salt, png.has_alpha, &header_erasure_positions, dx, dy);
         
         if (header_bits.size() < 96) {
             r.error_msg = "not enough data for ECC header";
@@ -1281,9 +1454,9 @@ ExtractResult extract_text_with_erasures(const std::string& stego_png,
         }
         
         std::vector<size_t> all_erasure_bit_positions;
-        auto all_bits = extract_bits_cell_major_with_erasures(
+        auto all_bits = extract_bits_cell_major_shifted(
             png.data.data(), orig_grid, png.width, png.height,
-            total_bits_needed, salt, png.has_alpha, &all_erasure_bit_positions, lo, to);
+            total_bits_needed, salt, png.has_alpha, &all_erasure_bit_positions, dx, dy);
         
         auto all_bytes = bits_to_bytes(all_bits);
         if (all_bytes.size() < total_bytes_needed) {
@@ -1319,116 +1492,55 @@ ExtractResult extract_text_with_erasures(const std::string& stego_png,
         // 6. Parse payload
         if (payload.size() < 4) { r.error_msg = "payload too short"; return r; }
         uint32_t text_len = read_u32_be(payload.data());
+        if (text_len == 0) { r.error_msg = "empty text"; return r; }
         if (4 + (size_t)text_len > payload.size()) { r.error_msg = "text len mismatch"; return r; }
+        
+        // Validate: text should be reasonable (printable UTF-8, not too long)
+        if (text_len > 10000) { r.error_msg = "text too long"; return r; }
         
         r.text.assign((const char*)(payload.data() + 4), text_len);
         r.success = true;
         return r;
     };
     
-    // Scan all possible crop offsets
+    // Scan all possible shifts - spiral from (0,0) outward
     std::string last_error;
-    for (int to = 0; to <= max_top_offset; to++) {
-        for (int lo = 0; lo <= max_left_offset; lo++) {
-            auto r = try_extract(lo, to);
-            if (r.success) {
-                if (max_top_offset > 0 || max_left_offset > 0) {
-                    std::cout << "  [INFO] Found at offset (left=" << lo << ", top=" << to << ")\n";
-                }
-                return r;
-            }
-            last_error = r.error_msg;
-        }
-    }
+    int iter_count = 0;
     
+    // Compute max search distance
+    int max_dist = 0;
+    if (min_dx < 0) max_dist = std::max(max_dist, -min_dx);
+    if (max_dx > 0) max_dist = std::max(max_dist, max_dx);
+    if (min_dy < 0) max_dist = std::max(max_dist, -min_dy);
+    if (max_dy > 0) max_dist = std::max(max_dist, max_dy);
     
-    // ===== 图片拓展提取 =====
-    // 如果裁剪扫描失败且图片比原图大，尝试拓展偏移
-    if (png.width >= orig_width || png.height >= orig_height) {
-        int ext_left_range = (int)(png.width >= orig_width ? png.width - orig_width : 0);
-        int ext_top_range = (int)(png.height >= orig_height ? png.height - orig_height : 0);
-        
-        // 限制最大搜索迭代次数
-        const int MAX_EXT_ITERATIONS_SINGLE = 2000;
-        int ext_iter_count = 0;
-        
-        for (int et = 0; et <= ext_top_range && !result.success; et++) {
-            for (int el = 0; el <= ext_left_range && !result.success; el++) {
-                if (el == 0 && et == 0) continue;
-                if (++ext_iter_count > MAX_EXT_ITERATIONS_SINGLE) goto ext_search_done;
+    for (int dist = 0; dist <= max_dist; dist++) {
+        for (int d_dy = -dist; d_dy <= dist; d_dy++) {
+            for (int d_dx = -dist; d_dx <= dist; d_dx++) {
+                if (std::max(std::abs(d_dx), std::abs(d_dy)) != dist) continue;
+                if (d_dx < min_dx || d_dx > max_dx) continue;
+                if (d_dy < min_dy || d_dy > max_dy) continue;
+                if (++iter_count > MAX_OFFSET_ITERATIONS) goto offset_search_done;
                 
-                // 提取 header
-                std::vector<size_t> ext_header_erasures;
-                auto ext_header_bits = extract_bits_cell_major_extension(
-                    png.data.data(), orig_grid, png.width, png.height,
-                    96, salt, png.has_alpha, &ext_header_erasures, el, et);
-                
-                if (ext_header_bits.size() < 96) continue;
-                
-                // 解析 header 获取 ecc_data_len
-                size_t ext_ecc_data_len;
-                {
-                    // Quick header parse to get ecc_data_len
-                    std::vector<size_t> es(ext_header_erasures.begin(), ext_header_erasures.end());
-                    std::sort(es.begin(), es.end());
-                    auto ie = [&es](size_t p) -> bool { return std::binary_search(es.begin(), es.end(), p); };
-                    
-                    std::vector<uint8_t> vh(12, 0);
-                    for (int bo = 0; bo < 32; bo++) {
-                        int vt[2] = {0, 0};
-                        for (int cp = 0; cp < 3; cp++) {
-                            size_t pos = (size_t)(cp * 32 + bo);
-                            if (pos < ext_header_bits.size() && !ie(pos)) vt[ext_header_bits[pos]]++;
-                        }
-                        uint8_t vb = (vt[1] > vt[0]) ? 1 : 0;
-                        if (vt[0] + vt[1] > 0) {
-                            for (int cp = 0; cp < 3; cp++)
-                                vh[cp * 4 + bo / 8] |= (vb << (7 - (bo % 8)));
-                        }
-                    }
-                    
-                    uint32_t l1 = read_u32_be(&vh[0]);
-                    uint32_t l2 = read_u32_be(&vh[4]);
-                    uint32_t l3 = read_u32_be(&vh[8]);
-                    if (l1 == l2 || l1 == l3) ext_ecc_data_len = l1;
-                    else if (l2 == l3) ext_ecc_data_len = l2;
-                    else ext_ecc_data_len = l1;
-                    
-                    if (ext_ecc_data_len == 0 || ext_ecc_data_len % 255 != 0) {
-                        size_t mpb = total_blocks * 3 / 8;
-                        uint32_t bl = 0, md = 0xFFFFFFFF;
-                        for (uint32_t c = 255; c <= mpb && c < 100000; c += 255) {
-                            uint32_t d = (c > ext_ecc_data_len) ? (c - ext_ecc_data_len) : (ext_ecc_data_len - c);
-                            if (d < md) { md = d; bl = c; }
-                        }
-                        if (bl > 0 && md < 32) ext_ecc_data_len = bl;
-                        else continue;
-                    }
+                auto r = try_extract(d_dx, d_dy);
+                if (r.success) {
+                    if (d_dx != 0 || d_dy != 0)
+                        std::cout << "  [INFO] Found at shift (dx=" << d_dx << ", dy=" << d_dy << ")\n";
+                    return r;
                 }
-                
-                // Full extraction
-                size_t ext_total_bits = (12 + ext_ecc_data_len) * 8;
-                if (ext_total_bits > total_blocks) continue;
-                
-                std::vector<size_t> ext_all_erasures;
-                auto ext_all_bits = extract_bits_cell_major_extension(
-                    png.data.data(), orig_grid, png.width, png.height,
-                    ext_total_bits, salt, png.has_alpha, &ext_all_erasures, el, et);
-                
-                auto ext_r = decode_ecc_payload(ext_all_bits, ext_all_erasures, total_blocks, npar, salt);
-                if (ext_r.success) {
-                    std::cout << "  [INFO] Extension detected: left=" << el << ", top=" << et << "\n";
-                    result = ext_r;
-                }
+                last_error = r.error_msg;
             }
         }
     }
-    ext_search_done:
+    offset_search_done:
     
-int total_offsets = (max_top_offset + 1) * (max_left_offset + 1);
+    if (result.success) return result;
+    
+    int total_offsets = (max_dx - min_dx + 1) * (max_dy - min_dy + 1);
+    if (total_offsets > MAX_OFFSET_ITERATIONS) total_offsets = MAX_OFFSET_ITERATIONS;
     result.error_msg = "failed across " + std::to_string(total_offsets) + 
-                      " crop offsets (top: 0-" + std::to_string(max_top_offset) + 
-                      ", left: 0-" + std::to_string(max_left_offset) + 
+                      " shifts (dx: " + std::to_string(min_dx) + " to " + std::to_string(max_dx) + 
+                      ", dy: " + std::to_string(min_dy) + " to " + std::to_string(max_dy) + 
                       "). Try multicluster mode for better recovery.";
     return result;
 }
@@ -1591,11 +1703,44 @@ ExtractResult extract_text_multicluster(const std::string& stego_png,
         return extract_text_with_erasures(stego_png, salt, ecc_level, orig_width, orig_height);
     }
     
-    // Calculate possible crop offset ranges
-    // The screenshot is assumed to be a crop of the original image
-    // We need to try all possible (left_offset, top_offset) values
-    int max_left_offset = (orig_width > png.width) ? (int)(orig_width - png.width) : 0;
-    int max_top_offset = (orig_height > png.height) ? (int)(orig_height - png.height) : 0;
+    // Calculate possible offset ranges for crop/extend scenarios
+    // left_offset semantics: px = gc*3 - left_offset (positive = content moved right)
+    // For crop+extend-back-to-same-size, offset can be positive or negative
+    int max_left_offset, min_left_offset;
+    if (png.width >= orig_width) {
+        // Image same size or bigger: content could have shifted right (positive offset)
+        max_left_offset = (int)(png.width - orig_width);
+        min_left_offset = 0;
+    } else {
+        // Image smaller: content shifted left (positive offset in old semantics)
+        max_left_offset = (int)(orig_width - png.width);
+        min_left_offset = 0;
+    }
+    // For same-size: content could have shifted either direction
+    if (png.width == orig_width) {
+        const int MC_MAX_SHIFT = 200;
+        min_left_offset = -MC_MAX_SHIFT;
+        max_left_offset = MC_MAX_SHIFT;
+    }
+    int max_top_offset, min_top_offset;
+    if (png.height >= orig_height) {
+        max_top_offset = (int)(png.height - orig_height);
+        min_top_offset = 0;
+    } else {
+        max_top_offset = (int)(orig_height - png.height);
+        min_top_offset = 0;
+    }
+    if (png.height == orig_height) {
+        const int MC_MAX_SHIFT = 200;
+        min_top_offset = -MC_MAX_SHIFT;
+        max_top_offset = MC_MAX_SHIFT;
+    }
+    const int MC_MAX_SHIFT_CAP = 200;
+    if (min_left_offset < -MC_MAX_SHIFT_CAP) min_left_offset = -MC_MAX_SHIFT_CAP;
+    if (max_left_offset > MC_MAX_SHIFT_CAP) max_left_offset = MC_MAX_SHIFT_CAP;
+    if (min_top_offset < -MC_MAX_SHIFT_CAP) min_top_offset = -MC_MAX_SHIFT_CAP;
+    if (max_top_offset > MC_MAX_SHIFT_CAP) max_top_offset = MC_MAX_SHIFT_CAP;
+    const int MC_MAX_OFFSET_ITERATIONS = 10000;
     
     // Lambda: try decoding one cluster at a given offset
     // Returns decoded text, or empty string on failure
@@ -1708,20 +1853,29 @@ ExtractResult extract_text_multicluster(const std::string& stego_png,
         // 6. Parse payload
         if (payload.size() < 4) return "";
         uint32_t decoded_text_len = read_u32_be(payload.data());
+        if (decoded_text_len == 0) return "";
         if (4 + (size_t)decoded_text_len > payload.size()) return "";
+        if (decoded_text_len > 10000) return "";
         
         return std::string((const char*)(payload.data() + 4), decoded_text_len);
     };
     
-    // Scan all possible crop offsets
+    // Scan all possible crop offsets - spiral from (0,0) outward
     std::vector<std::string> success_payloads;
     int best_lo = 0, best_to = 0;
+    int mc_iter_count = 0;
+    int mc_max_dist = std::max(std::max(std::abs(min_left_offset), std::abs(max_left_offset)),
+                               std::max(std::abs(min_top_offset), std::abs(max_top_offset)));
     
-    for (int to = 0; to <= max_top_offset; to++) {
-        for (int lo = 0; lo <= max_left_offset; lo++) {
+    for (int dist = 0; dist <= mc_max_dist; dist++) {
+        for (int to = -dist; to <= dist; to++) {
+            for (int lo = -dist; lo <= dist; lo++) {
+                if (std::max(std::abs(lo), std::abs(to)) != dist) continue;
+                if (lo < min_left_offset || lo > max_left_offset) continue;
+                if (to < min_top_offset || to > max_top_offset) continue;
+                if (++mc_iter_count > MC_MAX_OFFSET_ITERATIONS) goto done_scanning;
             // Quick scan: try header-only check on first cluster to filter offsets fast
-            // If the dimensions match (no crop), just try normally
-            bool any_offset = (max_top_offset > 0 || max_left_offset > 0);
+            bool any_offset = (lo != 0 || to != 0);
             
             if (any_offset) {
                 // Fast header check: extract 96 bits from cluster 0 with this offset
@@ -1796,112 +1950,17 @@ ExtractResult extract_text_multicluster(const std::string& stego_png,
             if (found_at_offset) {
                 goto done_scanning;
             }
+            }
         }
     }
     done_scanning:
     
     
-    // ===== 图片拓展提取（多簇模式）=====
-    if (success_payloads.empty() && (png.width >= orig_width || png.height >= orig_height)) {
-        int ext_left_range = (int)(png.width >= orig_width ? png.width - orig_width : 0);
-        int ext_top_range = (int)(png.height >= orig_height ? png.height - orig_height : 0);
-        
-        // 限制最大搜索迭代次数，防止内存溢出
-        const int MAX_EXT_ITERATIONS = 2000;
-        int ext_iteration_count = 0;
-        
-        for (int et = 0; et <= ext_top_range && success_payloads.empty(); et++) {
-            for (int el = 0; el <= ext_left_range && success_payloads.empty(); el++) {
-                if (el == 0 && et == 0) continue;
-                if (++ext_iteration_count > MAX_EXT_ITERATIONS) goto ext_done;
-                
-                for (int c = 0; c < num_clusters; c++) {
-                    int strip_start, strip_end;
-                    get_strip_range(orig_grid.grid_rows, num_clusters, c, strip_start, strip_end);
-                    if (strip_start >= strip_end) continue;
-                    
-                    uint64_t cluster_seed = salt * 10000 + c;
-                    
-                    // Extract header with extension offsets
-                    std::vector<size_t> ext_header_erasures;
-                    auto ext_header_bits = extract_bits_from_strip_extension(
-                        png.data.data(), orig_grid, png.width, png.height,
-                        96, cluster_seed, png.has_alpha,
-                        strip_start, strip_end, &ext_header_erasures, el, et);
-                    
-                    if (ext_header_bits.size() < 96) continue;
-                    
-                    // Quick header validation
-                    std::vector<size_t> es(ext_header_erasures.begin(), ext_header_erasures.end());
-                    std::sort(es.begin(), es.end());
-                    auto ie = [&es](size_t p) -> bool { return std::binary_search(es.begin(), es.end(), p); };
-                    
-                    std::vector<uint8_t> vh(12, 0);
-                    for (int bo = 0; bo < 32; bo++) {
-                        int vt[2] = {0, 0};
-                        for (int cp = 0; cp < 3; cp++) {
-                            size_t pos = (size_t)(cp * 32 + bo);
-                            if (pos < ext_header_bits.size() && !ie(pos)) vt[ext_header_bits[pos]]++;
-                        }
-                        uint8_t vb = (vt[1] > vt[0]) ? 1 : 0;
-                        if (vt[0] + vt[1] > 0) {
-                            for (int cp = 0; cp < 3; cp++)
-                                vh[cp * 4 + bo / 8] |= (vb << (7 - (bo % 8)));
-                        }
-                    }
-                    
-                    uint32_t ql = read_u32_be(&vh[0]);
-                    uint32_t ext_ecc_data_len;
-                    if (ql > 0 && ql % 255 == 0) {
-                        ext_ecc_data_len = ql;
-                    } else {
-                        bool close = false;
-                        for (uint32_t cand = 255; cand <= 65535; cand += 255) {
-                            uint32_t diff = (cand > ql) ? (cand - ql) : (ql - cand);
-                            if (diff < 32) { ext_ecc_data_len = cand; close = true; break; }
-                        }
-                        if (!close) continue;
-                    }
-                    
-                    // Capacity check: ensure ecc_data_len fits in this cluster's strip
-                    {
-                        int ss, se;
-                        get_strip_range(orig_grid.grid_rows, num_clusters, c, ss, se);
-                        size_t strip_blocks = ((size_t)(se - ss)) * orig_grid.grid_cols;
-                        size_t strip_capacity_bits = strip_blocks * 3;
-                        size_t needed_bits = (12 + ext_ecc_data_len) * 8;
-                        if (needed_bits > strip_capacity_bits) continue;
-                    }
-                    
-                    // Full extraction
-                    size_t total_bytes_needed = 12 + ext_ecc_data_len;
-                    size_t total_bits_needed = total_bytes_needed * 8;
-                    
-                    std::vector<size_t> ext_all_erasures;
-                    auto ext_all_bits = extract_bits_from_strip_extension(
-                        png.data.data(), orig_grid, png.width, png.height,
-                        total_bits_needed, cluster_seed, png.has_alpha,
-                        strip_start, strip_end, &ext_all_erasures, el, et);
-                    
-                    if (ext_all_bits.size() < total_bits_needed) continue;
-                    
-                    // Decode
-                    auto ext_r = decode_ecc_payload(ext_all_bits, ext_all_erasures, orig_grid.total_blocks() * 3, npar, cluster_seed);
-                    if (ext_r.success) {
-                        success_payloads.push_back(ext_r.text);
-                        std::cout << "  [INFO] Extension detected: left=" << el << ", top=" << et << " (cluster " << c << ")\n";
-                    }
-                }
-            }
-        }
-    }
-    ext_done:
-    
 if (success_payloads.empty()) {
-        int total_offsets = (max_top_offset + 1) * (max_left_offset + 1);
+        int total_offsets = (max_top_offset - min_top_offset + 1) * (max_left_offset - min_left_offset + 1);
         result.error_msg = "all clusters failed across " + std::to_string(total_offsets) + 
-                          " crop offsets (top: 0-" + std::to_string(max_top_offset) + 
-                          ", left: 0-" + std::to_string(max_left_offset) + ")";
+                          " offsets (top: " + std::to_string(min_top_offset) + " to " + std::to_string(max_top_offset) + 
+                          ", left: " + std::to_string(min_left_offset) + " to " + std::to_string(max_left_offset) + ")";
         return result;
     }
     
