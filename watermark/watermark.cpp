@@ -678,6 +678,255 @@ std::string majority_vote_text(const std::vector<std::string>& payloads) {
     return best;
 }
 
+
+// ========== 图片拓展提取辅助函数 ==========
+// 当图片被四边拓展（加边/加框）后，水印块整体偏移。
+// 需要按拓展偏移量搜索正确的水印位置。
+
+// 检查原始块在拓展图中是否完全处于原始内容区域内
+// orig_block_id: 基于原图网格的块ID
+// orig_grid_cols: 原图网格列数
+// ext_w, ext_h: 拓展图尺寸
+// ext_left, ext_top: 拓展量（原图在拓展图中的起始位置）
+bool block_in_bounds_extension(size_t orig_block_id, uint32_t orig_grid_cols,
+                               uint32_t ext_w, uint32_t ext_h,
+                               int ext_left, int ext_top) {
+    size_t gr = orig_block_id / orig_grid_cols;
+    size_t gc = orig_block_id % orig_grid_cols;
+    // 块左上角在拓展图中的位置
+    int px = (int)(gc * 3) + ext_left;
+    int py = (int)(gr * 3) + ext_top;
+    // 检查所有9个像素是否都在拓展图范围内
+    return (px >= 0) && (px + 2 < (int)ext_w) &&
+           (py >= 0) && (py + 2 < (int)ext_h);
+}
+
+// 从拓展图中提取块中心像素的LSB
+uint8_t extract_block_extension(const uint8_t* stego_data,
+                                uint32_t ext_w,
+                                size_t orig_block_id,
+                                uint32_t orig_grid_cols,
+                                int channel,
+                                int ext_left, int ext_top) {
+    size_t gr = orig_block_id / orig_grid_cols;
+    size_t gc = orig_block_id % orig_grid_cols;
+    int cx = (int)(gc * 3 + 1) + ext_left;
+    int cy = (int)(gr * 3 + 1) + ext_top;
+    size_t pixel_idx = (size_t)cy * ext_w + (size_t)cx;
+    return stego_data[pixel_idx * 4 + channel] & 1;
+}
+
+// 单元级提取（支持拓展偏移 + 擦除标记）
+std::vector<uint8_t> extract_bits_cell_major_extension(
+    const uint8_t* stego_data,
+    const BlockGrid& orig_grid,
+    uint32_t ext_w, uint32_t ext_h,
+    size_t max_bits,
+    uint64_t salt,
+    bool has_alpha,
+    std::vector<size_t>* out_erasure_bit_positions,
+    int ext_left, int ext_top) {
+
+    size_t cell_cols = orig_grid.grid_cols / 3;
+    size_t total_cells = cell_cols * orig_grid.grid_rows;
+    std::vector<uint8_t> all_bits;
+    all_bits.reserve(max_bits);
+    out_erasure_bit_positions->clear();
+
+    if (total_cells == 0) return all_bits;
+
+    auto cell_order = shuffle_blocks(total_cells, salt);
+
+    for (size_t ci = 0; ci < cell_order.size() && all_bits.size() < max_bits; ci++) {
+        size_t cell_id = cell_order[ci];
+        size_t cell_row = cell_id / cell_cols;
+        size_t cell_col = cell_id % cell_cols;
+
+        for (int k = 0; k < 3 && all_bits.size() < max_bits; k++) {
+            size_t block_col = cell_col * 3 + k;
+            if (block_col >= orig_grid.grid_cols) break;
+            size_t block_id = cell_row * orig_grid.grid_cols + block_col;
+
+            for (int ch = 0; ch < 3 && all_bits.size() < max_bits; ch++) {
+                if (k == 2 && ch == 2) break;
+                int channel = channel_for_index(ch, has_alpha);
+                size_t bit_pos = all_bits.size();
+
+                if (block_in_bounds_extension(block_id, orig_grid.grid_cols, ext_w, ext_h, ext_left, ext_top)) {
+                    uint8_t bit = extract_block_extension(stego_data, ext_w, block_id, orig_grid.grid_cols, channel, ext_left, ext_top);
+                    all_bits.push_back(bit);
+                } else {
+                    all_bits.push_back(0);
+                    out_erasure_bit_positions->push_back(bit_pos);
+                }
+            }
+        }
+    }
+
+    return all_bits;
+}
+
+// 从指定条带提取 bits（拓展模式）
+std::vector<uint8_t> extract_bits_from_strip_extension(
+    const uint8_t* stego_data,
+    const BlockGrid& orig_grid,
+    uint32_t ext_w, uint32_t ext_h,
+    size_t max_bits,
+    uint64_t cluster_seed,
+    bool has_alpha,
+    int strip_start_row, int strip_end_row,
+    std::vector<size_t>* out_erasure_positions,
+    int ext_left, int ext_top) {
+
+    int num_channels = 3;
+    std::vector<uint8_t> all_bits;
+    all_bits.reserve(max_bits);
+    out_erasure_positions->clear();
+
+    for (int ci = 0; ci < num_channels; ci++) {
+        int channel = channel_for_index(ci, has_alpha);
+        if (channel < 0) break;
+
+        size_t first_block = (size_t)strip_start_row * orig_grid.grid_cols;
+        size_t last_block = (size_t)strip_end_row * orig_grid.grid_cols;
+        size_t strip_block_count = last_block - first_block;
+
+        if (strip_block_count == 0) continue;
+
+        auto block_order = shuffle_blocks(strip_block_count, cluster_seed * 1000 + ci);
+
+        for (size_t bi = 0; bi < block_order.size(); bi++) {
+            size_t bit_pos = all_bits.size();
+            size_t orig_block_id = first_block + block_order[bi];
+
+            if (block_in_bounds_extension(orig_block_id, orig_grid.grid_cols, ext_w, ext_h, ext_left, ext_top)) {
+                uint8_t bit = extract_block_extension(stego_data, ext_w, orig_block_id, orig_grid.grid_cols, channel, ext_left, ext_top);
+                all_bits.push_back(bit);
+            } else {
+                all_bits.push_back(0);
+                out_erasure_positions->push_back(bit_pos);
+            }
+
+            if (all_bits.size() >= max_bits) return all_bits;
+        }
+    }
+
+    return all_bits;
+}
+
+// 从提取的bits解码ECC payload（共享逻辑，避免重复代码）
+ExtractResult decode_ecc_payload(
+    const std::vector<uint8_t>& all_bits,
+    const std::vector<size_t>& erasure_positions,
+    size_t total_blocks,
+    int npar,
+    uint64_t salt) {
+
+    ExtractResult r;
+
+    // 1. Header majority voting (96 bits -> 12 bytes)
+    std::vector<size_t> era_set(erasure_positions.begin(), erasure_positions.end());
+    std::sort(era_set.begin(), era_set.end());
+
+    auto is_erased = [&era_set](size_t pos) -> bool {
+        return std::binary_search(era_set.begin(), era_set.end(), pos);
+    };
+
+    std::vector<uint8_t> voted_header_bytes(12, 0);
+    for (int bit_offset = 0; bit_offset < 32; bit_offset++) {
+        int votes[2] = {0, 0};
+        for (int copy = 0; copy < 3; copy++) {
+            size_t pos = (size_t)(copy * 32 + bit_offset);
+            if (pos < all_bits.size() && !is_erased(pos)) {
+                votes[all_bits[pos]]++;
+            }
+        }
+        uint8_t voted_bit = (votes[1] > votes[0]) ? 1 : 0;
+        int total_votes = votes[0] + votes[1];
+        if (total_votes > 0) {
+            for (int copy = 0; copy < 3; copy++) {
+                int byte_idx = copy * 4 + bit_offset / 8;
+                int bit_in_byte = 7 - (bit_offset % 8);
+                voted_header_bytes[byte_idx] |= (voted_bit << bit_in_byte);
+            }
+        }
+    }
+
+    // 2. Parse header
+    uint32_t len1 = read_u32_be(&voted_header_bytes[0]);
+    uint32_t len2 = read_u32_be(&voted_header_bytes[4]);
+    uint32_t len3 = read_u32_be(&voted_header_bytes[8]);
+
+    uint32_t ecc_data_len;
+    if (len1 == len2 || len1 == len3) ecc_data_len = len1;
+    else if (len2 == len3) ecc_data_len = len2;
+    else ecc_data_len = len1;
+
+    if (ecc_data_len == 0 || ecc_data_len % 255 != 0) {
+        size_t max_possible_bytes = total_blocks * 3 / 8;
+        uint32_t best_len = 0;
+        uint32_t min_diff = 0xFFFFFFFF;
+        for (uint32_t candidate = 255; candidate <= max_possible_bytes && candidate < 100000; candidate += 255) {
+            uint32_t diff = (candidate > ecc_data_len) ? (candidate - ecc_data_len) : (ecc_data_len - candidate);
+            if (diff < min_diff) { min_diff = diff; best_len = candidate; }
+        }
+        if (best_len > 0 && min_diff < 255) ecc_data_len = best_len;
+        else { r.error_msg = "invalid header"; return r; }
+    }
+
+    // 3. Extract ECC data
+    size_t total_bytes_needed = 12 + ecc_data_len;
+    size_t total_bits_needed = total_bytes_needed * 8;
+
+    if (total_bits_needed > total_blocks) {
+        r.error_msg = "ECC data exceeds capacity";
+        return r;
+    }
+
+    auto all_bytes = bits_to_bytes(all_bits);
+    if (all_bytes.size() < total_bytes_needed) {
+        r.error_msg = "not enough data";
+        return r;
+    }
+
+    std::vector<uint8_t> ecc_data(all_bytes.begin() + 12, all_bytes.begin() + 12 + ecc_data_len);
+
+    // 4. Bit-level erasures -> RS symbol-level erasures
+    size_t num_rs_blocks = ecc_data_len / 255;
+    std::vector<std::vector<int>> erasures_per_block(num_rs_blocks);
+
+    for (size_t bit_pos : era_set) {
+        if (bit_pos < 96) continue;
+        size_t byte_offset = (bit_pos - 96) / 8;
+        size_t rs_block_idx = byte_offset / 255;
+        int symbol_idx = (int)(byte_offset % 255);
+        if (rs_block_idx < num_rs_blocks) {
+            auto& evec = erasures_per_block[rs_block_idx];
+            if (std::find(evec.begin(), evec.end(), symbol_idx) == evec.end())
+                evec.push_back(symbol_idx);
+        }
+    }
+
+    // 5. RS decode
+    auto payload = rs_codec::rs_decode_with_erasures(ecc_data, npar, erasures_per_block);
+    if (payload.empty()) {
+        payload = rs_codec::rs_decode(ecc_data, npar);
+    }
+    if (payload.empty()) {
+        r.error_msg = "RS decode failed";
+        return r;
+    }
+
+    // 6. Parse payload
+    if (payload.size() < 4) { r.error_msg = "payload too short"; return r; }
+    uint32_t text_len = read_u32_be(payload.data());
+    if (4 + (size_t)text_len > payload.size()) { r.error_msg = "text len mismatch"; return r; }
+
+    r.text.assign((const char*)(payload.data() + 4), text_len);
+    r.success = true;
+    return r;
+}
+
 } // anonymous namespace
 
 // ========================================================================
@@ -1092,7 +1341,91 @@ ExtractResult extract_text_with_erasures(const std::string& stego_png,
         }
     }
     
-    int total_offsets = (max_top_offset + 1) * (max_left_offset + 1);
+    
+    // ===== 图片拓展提取 =====
+    // 如果裁剪扫描失败且图片比原图大，尝试拓展偏移
+    if (png.width >= orig_width || png.height >= orig_height) {
+        int ext_left_range = (int)(png.width >= orig_width ? png.width - orig_width : 0);
+        int ext_top_range = (int)(png.height >= orig_height ? png.height - orig_height : 0);
+        
+        // 限制最大搜索迭代次数
+        const int MAX_EXT_ITERATIONS_SINGLE = 2000;
+        int ext_iter_count = 0;
+        
+        for (int et = 0; et <= ext_top_range && !result.success; et++) {
+            for (int el = 0; el <= ext_left_range && !result.success; el++) {
+                if (el == 0 && et == 0) continue;
+                if (++ext_iter_count > MAX_EXT_ITERATIONS_SINGLE) goto ext_search_done;
+                
+                // 提取 header
+                std::vector<size_t> ext_header_erasures;
+                auto ext_header_bits = extract_bits_cell_major_extension(
+                    png.data.data(), orig_grid, png.width, png.height,
+                    96, salt, png.has_alpha, &ext_header_erasures, el, et);
+                
+                if (ext_header_bits.size() < 96) continue;
+                
+                // 解析 header 获取 ecc_data_len
+                size_t ext_ecc_data_len;
+                {
+                    // Quick header parse to get ecc_data_len
+                    std::vector<size_t> es(ext_header_erasures.begin(), ext_header_erasures.end());
+                    std::sort(es.begin(), es.end());
+                    auto ie = [&es](size_t p) -> bool { return std::binary_search(es.begin(), es.end(), p); };
+                    
+                    std::vector<uint8_t> vh(12, 0);
+                    for (int bo = 0; bo < 32; bo++) {
+                        int vt[2] = {0, 0};
+                        for (int cp = 0; cp < 3; cp++) {
+                            size_t pos = (size_t)(cp * 32 + bo);
+                            if (pos < ext_header_bits.size() && !ie(pos)) vt[ext_header_bits[pos]]++;
+                        }
+                        uint8_t vb = (vt[1] > vt[0]) ? 1 : 0;
+                        if (vt[0] + vt[1] > 0) {
+                            for (int cp = 0; cp < 3; cp++)
+                                vh[cp * 4 + bo / 8] |= (vb << (7 - (bo % 8)));
+                        }
+                    }
+                    
+                    uint32_t l1 = read_u32_be(&vh[0]);
+                    uint32_t l2 = read_u32_be(&vh[4]);
+                    uint32_t l3 = read_u32_be(&vh[8]);
+                    if (l1 == l2 || l1 == l3) ext_ecc_data_len = l1;
+                    else if (l2 == l3) ext_ecc_data_len = l2;
+                    else ext_ecc_data_len = l1;
+                    
+                    if (ext_ecc_data_len == 0 || ext_ecc_data_len % 255 != 0) {
+                        size_t mpb = total_blocks * 3 / 8;
+                        uint32_t bl = 0, md = 0xFFFFFFFF;
+                        for (uint32_t c = 255; c <= mpb && c < 100000; c += 255) {
+                            uint32_t d = (c > ext_ecc_data_len) ? (c - ext_ecc_data_len) : (ext_ecc_data_len - c);
+                            if (d < md) { md = d; bl = c; }
+                        }
+                        if (bl > 0 && md < 32) ext_ecc_data_len = bl;
+                        else continue;
+                    }
+                }
+                
+                // Full extraction
+                size_t ext_total_bits = (12 + ext_ecc_data_len) * 8;
+                if (ext_total_bits > total_blocks) continue;
+                
+                std::vector<size_t> ext_all_erasures;
+                auto ext_all_bits = extract_bits_cell_major_extension(
+                    png.data.data(), orig_grid, png.width, png.height,
+                    ext_total_bits, salt, png.has_alpha, &ext_all_erasures, el, et);
+                
+                auto ext_r = decode_ecc_payload(ext_all_bits, ext_all_erasures, total_blocks, npar, salt);
+                if (ext_r.success) {
+                    std::cout << "  [INFO] Extension detected: left=" << el << ", top=" << et << "\n";
+                    result = ext_r;
+                }
+            }
+        }
+    }
+    ext_search_done:
+    
+int total_offsets = (max_top_offset + 1) * (max_left_offset + 1);
     result.error_msg = "failed across " + std::to_string(total_offsets) + 
                       " crop offsets (top: 0-" + std::to_string(max_top_offset) + 
                       ", left: 0-" + std::to_string(max_left_offset) + 
@@ -1467,7 +1800,104 @@ ExtractResult extract_text_multicluster(const std::string& stego_png,
     }
     done_scanning:
     
-    if (success_payloads.empty()) {
+    
+    // ===== 图片拓展提取（多簇模式）=====
+    if (success_payloads.empty() && (png.width >= orig_width || png.height >= orig_height)) {
+        int ext_left_range = (int)(png.width >= orig_width ? png.width - orig_width : 0);
+        int ext_top_range = (int)(png.height >= orig_height ? png.height - orig_height : 0);
+        
+        // 限制最大搜索迭代次数，防止内存溢出
+        const int MAX_EXT_ITERATIONS = 2000;
+        int ext_iteration_count = 0;
+        
+        for (int et = 0; et <= ext_top_range && success_payloads.empty(); et++) {
+            for (int el = 0; el <= ext_left_range && success_payloads.empty(); el++) {
+                if (el == 0 && et == 0) continue;
+                if (++ext_iteration_count > MAX_EXT_ITERATIONS) goto ext_done;
+                
+                for (int c = 0; c < num_clusters; c++) {
+                    int strip_start, strip_end;
+                    get_strip_range(orig_grid.grid_rows, num_clusters, c, strip_start, strip_end);
+                    if (strip_start >= strip_end) continue;
+                    
+                    uint64_t cluster_seed = salt * 10000 + c;
+                    
+                    // Extract header with extension offsets
+                    std::vector<size_t> ext_header_erasures;
+                    auto ext_header_bits = extract_bits_from_strip_extension(
+                        png.data.data(), orig_grid, png.width, png.height,
+                        96, cluster_seed, png.has_alpha,
+                        strip_start, strip_end, &ext_header_erasures, el, et);
+                    
+                    if (ext_header_bits.size() < 96) continue;
+                    
+                    // Quick header validation
+                    std::vector<size_t> es(ext_header_erasures.begin(), ext_header_erasures.end());
+                    std::sort(es.begin(), es.end());
+                    auto ie = [&es](size_t p) -> bool { return std::binary_search(es.begin(), es.end(), p); };
+                    
+                    std::vector<uint8_t> vh(12, 0);
+                    for (int bo = 0; bo < 32; bo++) {
+                        int vt[2] = {0, 0};
+                        for (int cp = 0; cp < 3; cp++) {
+                            size_t pos = (size_t)(cp * 32 + bo);
+                            if (pos < ext_header_bits.size() && !ie(pos)) vt[ext_header_bits[pos]]++;
+                        }
+                        uint8_t vb = (vt[1] > vt[0]) ? 1 : 0;
+                        if (vt[0] + vt[1] > 0) {
+                            for (int cp = 0; cp < 3; cp++)
+                                vh[cp * 4 + bo / 8] |= (vb << (7 - (bo % 8)));
+                        }
+                    }
+                    
+                    uint32_t ql = read_u32_be(&vh[0]);
+                    uint32_t ext_ecc_data_len;
+                    if (ql > 0 && ql % 255 == 0) {
+                        ext_ecc_data_len = ql;
+                    } else {
+                        bool close = false;
+                        for (uint32_t cand = 255; cand <= 65535; cand += 255) {
+                            uint32_t diff = (cand > ql) ? (cand - ql) : (ql - cand);
+                            if (diff < 32) { ext_ecc_data_len = cand; close = true; break; }
+                        }
+                        if (!close) continue;
+                    }
+                    
+                    // Capacity check: ensure ecc_data_len fits in this cluster's strip
+                    {
+                        int ss, se;
+                        get_strip_range(orig_grid.grid_rows, num_clusters, c, ss, se);
+                        size_t strip_blocks = ((size_t)(se - ss)) * orig_grid.grid_cols;
+                        size_t strip_capacity_bits = strip_blocks * 3;
+                        size_t needed_bits = (12 + ext_ecc_data_len) * 8;
+                        if (needed_bits > strip_capacity_bits) continue;
+                    }
+                    
+                    // Full extraction
+                    size_t total_bytes_needed = 12 + ext_ecc_data_len;
+                    size_t total_bits_needed = total_bytes_needed * 8;
+                    
+                    std::vector<size_t> ext_all_erasures;
+                    auto ext_all_bits = extract_bits_from_strip_extension(
+                        png.data.data(), orig_grid, png.width, png.height,
+                        total_bits_needed, cluster_seed, png.has_alpha,
+                        strip_start, strip_end, &ext_all_erasures, el, et);
+                    
+                    if (ext_all_bits.size() < total_bits_needed) continue;
+                    
+                    // Decode
+                    auto ext_r = decode_ecc_payload(ext_all_bits, ext_all_erasures, orig_grid.total_blocks() * 3, npar, cluster_seed);
+                    if (ext_r.success) {
+                        success_payloads.push_back(ext_r.text);
+                        std::cout << "  [INFO] Extension detected: left=" << el << ", top=" << et << " (cluster " << c << ")\n";
+                    }
+                }
+            }
+        }
+    }
+    ext_done:
+    
+if (success_payloads.empty()) {
         int total_offsets = (max_top_offset + 1) * (max_left_offset + 1);
         result.error_msg = "all clusters failed across " + std::to_string(total_offsets) + 
                           " crop offsets (top: 0-" + std::to_string(max_top_offset) + 

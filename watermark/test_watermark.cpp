@@ -772,6 +772,301 @@ void test_multicluster_backward_compat() {
     CHECK(xr_era.text == text, "original erasure text matches");
 }
 
+void test_multicluster_crop_left() {
+    std::cout << "\n=== MultiCluster: Left Crop Recovery (10 clusters) ===\n";
+    
+    uint32_t W = 600, H = 600;
+    make_test_png("test_mc_crop_left.png", W, H, true);
+    
+    std::string text = "Left crop recovery!";
+    uint64_t salt = 99999;
+    int ecc_level = 6;
+    int num_clusters = 10;
+    
+    auto er = embed_text_multicluster("test_mc_crop_left.png", "test_mc_crop_left_out.png",
+                                       text, salt, ecc_level, num_clusters);
+    CHECK(er.success, "embed ok");
+    if (!er.success) return;
+    
+    // Load stego and crop from LEFT side (remove 60 pixels = 20 block columns)
+    std::vector<uint8_t> orig_data;
+    uint32_t orig_w, orig_h;
+    unsigned decode_err = lodepng::decode(orig_data, orig_w, orig_h,
+                                          "test_mc_crop_left_out.png", LCT_RGBA, 8);
+    CHECK(decode_err == 0, "loaded stego image");
+    
+    uint32_t crop_left = 60; // Remove 60 pixels from left
+    uint32_t crop_w = W - crop_left;
+    std::vector<uint8_t> crop_data(H * crop_w * 4, 0);
+    for (uint32_t y = 0; y < H; y++) {
+        memcpy(crop_data.data() + y * crop_w * 4, 
+               orig_data.data() + y * W * 4 + crop_left * 4, 
+               crop_w * 4);
+    }
+    
+    lodepng::encode("test_mc_crop_left_cropped.png", crop_data, crop_w, H, LCT_RGBA, 8);
+    
+    std::cout << "  Cropped from " << W << "x" << H << " to " << crop_w << "x" << H << " (left crop)\n";
+    
+    // Multi-cluster extract with offset scanning
+    auto xr_mc = extract_text_multicluster("test_mc_crop_left_cropped.png", salt, ecc_level,
+                                            num_clusters, W, H);
+    CHECK(xr_mc.success, "multicluster extraction succeeded after left crop");
+    if (xr_mc.success) {
+        CHECK(xr_mc.text == text, "text matches: \"" + xr_mc.text + "\"");
+    } else {
+        std::cout << "  Error: " << xr_mc.error_msg << "\n";
+        fail++;
+    }
+}
+
+void test_multicluster_crop_right() {
+    std::cout << "\n=== MultiCluster: Right Crop Recovery (10 clusters) ===\n";
+    
+    uint32_t W = 600, H = 600;
+    make_test_png("test_mc_crop_right.png", W, H, true);
+    
+    std::string text = "Right crop recovery!";
+    uint64_t salt = 88888;
+    int ecc_level = 6;
+    int num_clusters = 10;
+    
+    auto er = embed_text_multicluster("test_mc_crop_right.png", "test_mc_crop_right_out.png",
+                                       text, salt, ecc_level, num_clusters);
+    CHECK(er.success, "embed ok");
+    if (!er.success) return;
+    
+    // Load stego and crop from RIGHT side (remove 60 pixels)
+    std::vector<uint8_t> orig_data;
+    uint32_t orig_w, orig_h;
+    unsigned decode_err = lodepng::decode(orig_data, orig_w, orig_h,
+                                          "test_mc_crop_right_out.png", LCT_RGBA, 8);
+    CHECK(decode_err == 0, "loaded stego image");
+    
+    uint32_t crop_right = 60;
+    uint32_t crop_w = W - crop_right;
+    std::vector<uint8_t> crop_data(H * crop_w * 4, 0);
+    for (uint32_t y = 0; y < H; y++) {
+        memcpy(crop_data.data() + y * crop_w * 4, 
+               orig_data.data() + y * W * 4, 
+               crop_w * 4);
+    }
+    
+    lodepng::encode("test_mc_crop_right_cropped.png", crop_data, crop_w, H, LCT_RGBA, 8);
+    
+    std::cout << "  Cropped from " << W << "x" << H << " to " << crop_w << "x" << H << " (right crop)\n";
+    
+    auto xr_mc = extract_text_multicluster("test_mc_crop_right_cropped.png", salt, ecc_level,
+                                            num_clusters, W, H);
+    CHECK(xr_mc.success, "multicluster extraction succeeded after right crop");
+    if (xr_mc.success) {
+        CHECK(xr_mc.text == text, "text matches: \"" + xr_mc.text + "\"");
+    } else {
+        std::cout << "  Error: " << xr_mc.error_msg << "\n";
+        fail++;
+    }
+}
+
+void test_single_cluster_crop_left() {
+    std::cout << "\n=== Single Cluster: Left Crop Recovery (ECC 6, option 4) ===\n";
+    
+    uint32_t W = 600, H = 600;
+    make_test_png("test_sc_crop_left.png", W, H, true);
+    
+    std::string text = "Single cluster left crop!";
+    uint64_t salt = 77777;
+    int ecc_level = 6;
+    
+    auto er = embed_text("test_sc_crop_left.png", "test_sc_crop_left_out.png",
+                          text, salt, ecc_level);
+    CHECK(er.success, "embed ok");
+    if (!er.success) return;
+    
+    // Load stego and crop from LEFT side
+    std::vector<uint8_t> orig_data;
+    uint32_t orig_w, orig_h;
+    lodepng::decode(orig_data, orig_w, orig_h, "test_sc_crop_left_out.png", LCT_RGBA, 8);
+    
+    uint32_t crop_left = 60;
+    uint32_t crop_w = W - crop_left;
+    std::vector<uint8_t> crop_data(H * crop_w * 4, 0);
+    for (uint32_t y = 0; y < H; y++) {
+        memcpy(crop_data.data() + y * crop_w * 4, 
+               orig_data.data() + y * W * 4 + crop_left * 4, 
+               crop_w * 4);
+    }
+    
+    lodepng::encode("test_sc_crop_left_cropped.png", crop_data, crop_w, H, LCT_RGBA, 8);
+    
+    std::cout << "  Cropped from " << W << "x" << H << " to " << crop_w << "x" << H << " (left crop)\n";
+    
+    // Use extract_text_with_erasures (option 4) for single cluster
+    auto xr = extract_text_with_erasures("test_sc_crop_left_cropped.png", salt, ecc_level, W, H);
+    CHECK(xr.success, "single-cluster extraction (option 4) succeeded after left crop");
+    if (xr.success) {
+        CHECK(xr.text == text, "text matches: \"" + xr.text + "\"");
+    } else {
+        std::cout << "  Error: " << xr.error_msg << "\n";
+        fail++;
+    }
+}
+
+void test_single_cluster_multicluster_extract_crop_left() {
+    std::cout << "\n=== Single Cluster Embedded, Multicluster Extract (option 5), Left Crop ===\n";
+    
+    uint32_t W = 600, H = 600;
+    make_test_png("test_sc_mc_extract_left.png", W, H, true);
+    
+    std::string text = "Single cluster with option 5 extract!";
+    uint64_t salt = 55555;
+    int ecc_level = 6;
+    int num_clusters = 1;
+    
+    auto er = embed_text_multicluster("test_sc_mc_extract_left.png", "test_sc_mc_extract_left_out.png",
+                                       text, salt, ecc_level, num_clusters);
+    CHECK(er.success, "embed ok (1 cluster)");
+    if (!er.success) return;
+    
+    // Load stego and crop from LEFT side
+    std::vector<uint8_t> orig_data;
+    uint32_t orig_w, orig_h;
+    lodepng::decode(orig_data, orig_w, orig_h, "test_sc_mc_extract_left_out.png", LCT_RGBA, 8);
+    
+    uint32_t crop_left = 60;
+    uint32_t crop_w = W - crop_left;
+    std::vector<uint8_t> crop_data(H * crop_w * 4, 0);
+    for (uint32_t y = 0; y < H; y++) {
+        memcpy(crop_data.data() + y * crop_w * 4, 
+               orig_data.data() + y * W * 4 + crop_left * 4, 
+               crop_w * 4);
+    }
+    
+    lodepng::encode("test_sc_mc_extract_left_cropped.png", crop_data, crop_w, H, LCT_RGBA, 8);
+    
+    std::cout << "  Cropped from " << W << "x" << H << " to " << crop_w << "x" << H << " (left crop)\n";
+    
+    // Use extract_text_multicluster (option 5) with num_clusters=1
+    auto xr = extract_text_multicluster("test_sc_mc_extract_left_cropped.png", salt, ecc_level,
+                                         num_clusters, W, H);
+    CHECK(xr.success, "multicluster extraction (option 5, 1 cluster) succeeded after left crop");
+    if (xr.success) {
+        CHECK(xr.text == text, "text matches: \"" + xr.text + "\"");
+    } else {
+        std::cout << "  Error: " << xr.error_msg << "\n";
+        fail++;
+    }
+}
+
+void test_single_cluster_multicluster_extract_crop_right() {
+    std::cout << "\n=== Single Cluster Embedded, Multicluster Extract (option 5), Right Crop ===\n";
+    
+    uint32_t W = 600, H = 600;
+    make_test_png("test_sc_mc_extract_right.png", W, H, true);
+    
+    std::string text = "Single cluster right crop option 5!";
+    uint64_t salt = 44444;
+    int ecc_level = 6;
+    int num_clusters = 1;
+    
+    auto er = embed_text_multicluster("test_sc_mc_extract_right.png", "test_sc_mc_extract_right_out.png",
+                                       text, salt, ecc_level, num_clusters);
+    CHECK(er.success, "embed ok (1 cluster)");
+    if (!er.success) return;
+    
+    // Load stego and crop from RIGHT side
+    std::vector<uint8_t> orig_data;
+    uint32_t orig_w, orig_h;
+    lodepng::decode(orig_data, orig_w, orig_h, "test_sc_mc_extract_right_out.png", LCT_RGBA, 8);
+    
+    uint32_t crop_right = 60;
+    uint32_t crop_w = W - crop_right;
+    std::vector<uint8_t> crop_data(H * crop_w * 4, 0);
+    for (uint32_t y = 0; y < H; y++) {
+        memcpy(crop_data.data() + y * crop_w * 4, 
+               orig_data.data() + y * W * 4, 
+               crop_w * 4);
+    }
+    
+    lodepng::encode("test_sc_mc_extract_right_cropped.png", crop_data, crop_w, H, LCT_RGBA, 8);
+    
+    std::cout << "  Cropped from " << W << "x" << H << " to " << crop_w << "x" << H << " (right crop)\n";
+    
+    // Use extract_text_multicluster (option 5) with num_clusters=1
+    auto xr = extract_text_multicluster("test_sc_mc_extract_right_cropped.png", salt, ecc_level,
+                                         num_clusters, W, H);
+    CHECK(xr.success, "multicluster extraction (option 5, 1 cluster) succeeded after right crop");
+    if (xr.success) {
+        CHECK(xr.text == text, "text matches: \"" + xr.text + "\"");
+    } else {
+        std::cout << "  Error: " << xr.error_msg << "\n";
+        fail++;
+    }
+}
+
+void test_single_cluster_crop_combined() {
+    std::cout << "\n=== Single Cluster: Combined Crop (left+top) ===\n";
+    
+    uint32_t W = 600, H = 600;
+    make_test_png("test_sc_crop_both.png", W, H, true);
+    
+    std::string text = "Combined crop test!";
+    uint64_t salt = 99999;
+    int ecc_level = 6;
+    
+    auto er = embed_text("test_sc_crop_both.png", "test_sc_crop_both_out.png",
+                          text, salt, ecc_level);
+    CHECK(er.success, "embed ok");
+    if (!er.success) return;
+    
+    // Crop from LEFT (60px) and TOP (30px)
+    std::vector<uint8_t> orig_data;
+    uint32_t orig_w, orig_h;
+    lodepng::decode(orig_data, orig_w, orig_h, "test_sc_crop_both_out.png", LCT_RGBA, 8);
+    
+    uint32_t crop_left = 60, crop_top = 30;
+    uint32_t crop_w = W - crop_left;
+    uint32_t crop_h = H - crop_top;
+    std::vector<uint8_t> crop_data(crop_h * crop_w * 4, 0);
+    for (uint32_t y = 0; y < crop_h; y++) {
+        memcpy(crop_data.data() + y * crop_w * 4, 
+               orig_data.data() + (y + crop_top) * W * 4 + crop_left * 4, 
+               crop_w * 4);
+    }
+    
+    lodepng::encode("test_sc_crop_both_cropped.png", crop_data, crop_w, crop_h, LCT_RGBA, 8);
+    
+    std::cout << "  Cropped from " << W << "x" << H << " to " << crop_w << "x" << crop_h 
+              << " (left=" << crop_left << ", top=" << crop_top << ")\n";
+    
+    // Test all 4 corners: crop starts at (cl, ct) with size (crop_w, crop_h)
+    // (0,0)=left+top cut, (60,0)=right+top cut, (0,30)=left+bottom cut, (60,30)=right+bottom cut
+    auto test_corner = [&](uint32_t cl, uint32_t ct, const char* name) {
+        std::vector<uint8_t> cdata(crop_h * crop_w * 4, 0);
+        for (uint32_t y = 0; y < crop_h; y++) {
+            memcpy(cdata.data() + y * crop_w * 4, 
+                   orig_data.data() + (y + ct) * W * 4 + cl * 4, 
+                   crop_w * 4);
+        }
+        std::string fname = std::string("test_sc_crop_") + name + ".png";
+        lodepng::encode(fname, cdata, crop_w, crop_h, LCT_RGBA, 8);
+        
+        auto xr2 = extract_text_with_erasures(fname, salt, ecc_level, W, H);
+        CHECK(xr2.success, std::string(name) + " crop extraction succeeded");
+        if (xr2.success) {
+            CHECK(xr2.text == text, std::string(name) + " text matches");
+        } else {
+            std::cout << "  Error (" << name << "): " << xr2.error_msg << "\n";
+            fail++;
+        }
+    };
+    
+    // cl=0,left cut; cl=60,right cut. ct=0,top cut; ct=30,bottom cut
+    test_corner(0,        0,         "left+top");
+    test_corner(crop_left, 0,        "right+top");
+    test_corner(0,        crop_top,  "left+bottom");
+    test_corner(crop_left, crop_top, "right+bottom");
+}
+
 int main() {
     std::cout << "========================================\n";
     std::cout << "  PNG Watermark Tool - Automated Test\n";
@@ -816,6 +1111,12 @@ int main() {
     test_multicluster_capacity();
     test_multicluster_crop_30();
     test_multicluster_crop_50();
+    test_multicluster_crop_left();
+    test_multicluster_crop_right();
+    test_single_cluster_crop_left();
+    test_single_cluster_multicluster_extract_crop_left();
+    test_single_cluster_multicluster_extract_crop_right();
+    test_single_cluster_crop_combined();
     test_multicluster_single();
     test_multicluster_utf8();
     test_multicluster_backward_compat();

@@ -741,7 +741,7 @@ int main(int argc, char* argv[]) {
     
     std::cout << "\n";
     std::cout << "╔══════════════════════════════════════════╗\n";
-    std::cout << "║    PNG 不可见水印工具 v2.2              ║\n";
+    std::cout << "║    PNG 不可见水印工具 v2.3              ║\n";
     std::cout << "║    ±1 LSB Matching + 3x3 Block          ║\n";
     std::cout << "║    + Reed-Solomon ECC + 多簇冗余        ║\n";
     std::cout << "╚══════════════════════════════════════════╝\n";
