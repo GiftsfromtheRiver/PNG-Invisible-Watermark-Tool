@@ -461,6 +461,105 @@ std::vector<uint8_t> extract_bits_with_erasures(
     return all_bits;
 }
 
+// ---------- 字节级单元 + 空间局部性 (ECC 专用) ----------
+// 核心思想：每个 RS 字节的 8 bit 来自同一"单元"（3 个相邻块 × 3 通道 = 9 位，用 8 位）
+// 单元通过 salt 打乱分散到全图，保证：
+//   1) 裁剪删除的块集中在少数单元内 → 每个被删单元 = 1 个 RS 符号擦除
+//   2) 相比旧方案（1 块 = 1 bit 散布到多个符号），擦除数降为 ~1/8
+//
+// 单元定义：同行连续 3 个 block，编号 (row, cell_col)
+//   block 0 的通道 0,1,2 → bit 0,1,2
+//   block 1 的通道 0,1,2 → bit 3,4,5
+//   block 2 的通道 0,1   → bit 6,7   (通道 2 跳过，每单元 8 bit)
+
+void embed_bits_cell_major(uint8_t* image_data,
+                            const BlockGrid& grid,
+                            const std::vector<uint8_t>& bits,
+                            uint64_t salt,
+                            bool has_alpha) {
+    size_t cell_cols = grid.grid_cols / 3;
+    size_t total_cells = cell_cols * grid.grid_rows;
+    if (total_cells == 0) return;
+    
+    auto cell_order = shuffle_blocks(total_cells, salt);
+    
+    size_t bits_written = 0;
+    for (size_t ci = 0; ci < cell_order.size() && bits_written < bits.size(); ci++) {
+        size_t cell_id = cell_order[ci];
+        size_t cell_row = cell_id / cell_cols;
+        size_t cell_col = cell_id % cell_cols;
+        
+        // 遍历单元内 3 个 block，每个 block 3 通道，共 9 位，只用前 8 位
+        for (int k = 0; k < 3 && bits_written < bits.size(); k++) {
+            size_t block_col = cell_col * 3 + k;
+            if (block_col >= grid.grid_cols) break;
+            size_t block_id = cell_row * grid.grid_cols + block_col;
+            
+            for (int ch = 0; ch < 3 && bits_written < bits.size(); ch++) {
+                if (k == 2 && ch == 2) break; // 跳过第 9 位
+                int channel = channel_for_index(ch, has_alpha);
+                embed_block(image_data, grid, channel, block_id,
+                           bits[bits_written], salt, bits_written);
+                bits_written++;
+            }
+        }
+    }
+}
+
+// 单元级提取（支持擦除标记）
+std::vector<uint8_t> extract_bits_cell_major_with_erasures(
+    const uint8_t* stego_data,
+    const BlockGrid& orig_grid,
+    uint32_t stego_w, uint32_t stego_h,
+    size_t max_bits,
+    uint64_t salt,
+    bool has_alpha,
+    std::vector<size_t>* out_erasure_bit_positions,
+    int left_offset, int top_offset) {
+    
+    size_t cell_cols = orig_grid.grid_cols / 3;
+    size_t total_cells = cell_cols * orig_grid.grid_rows;
+    std::vector<uint8_t> all_bits;
+    all_bits.reserve(max_bits);
+    out_erasure_bit_positions->clear();
+    
+    BlockGrid stego_grid = orig_grid;
+    stego_grid.img_width = stego_w;
+    stego_grid.img_height = stego_h;
+    
+    if (total_cells == 0) return all_bits;
+    
+    auto cell_order = shuffle_blocks(total_cells, salt);
+    
+    for (size_t ci = 0; ci < cell_order.size() && all_bits.size() < max_bits; ci++) {
+        size_t cell_id = cell_order[ci];
+        size_t cell_row = cell_id / cell_cols;
+        size_t cell_col = cell_id % cell_cols;
+        
+        for (int k = 0; k < 3 && all_bits.size() < max_bits; k++) {
+            size_t block_col = cell_col * 3 + k;
+            if (block_col >= orig_grid.grid_cols) break;
+            size_t block_id = cell_row * orig_grid.grid_cols + block_col;
+            
+            for (int ch = 0; ch < 3 && all_bits.size() < max_bits; ch++) {
+                if (k == 2 && ch == 2) break;
+                int channel = channel_for_index(ch, has_alpha);
+                size_t bit_pos = all_bits.size();
+                
+                if (block_in_bounds(orig_grid, block_id, stego_w, stego_h, left_offset, top_offset)) {
+                    uint8_t bit = extract_block(stego_data, stego_grid, channel, block_id, left_offset, top_offset);
+                    all_bits.push_back(bit);
+                } else {
+                    all_bits.push_back(0);
+                    out_erasure_bit_positions->push_back(bit_pos);
+                }
+            }
+        }
+    }
+    
+    return all_bits;
+}
+
 // ---------- 多簇辅助函数 ----------
 
 // 获取条带行范围
@@ -659,13 +758,25 @@ EmbedResult embed_text(const std::string& input_png,
         bits = bytes_to_bits(total_bytes);
     }
     
-    if (bits.size() > total_blocks) {
-        result.error_msg = "text too large (" + std::to_string(bits.size()) + 
-                          " bits needed, " + std::to_string(total_blocks) + " available)";
-        return result;
+    if (ecc_level > 0) {
+        // Cell-major capacity: each cell = 3 blocks × 3 channels = 8 bits used
+        size_t cell_cols = grid.grid_cols / 3;
+        size_t total_cells = cell_cols * grid.grid_rows;
+        size_t cell_capacity = total_cells * 8;
+        if (bits.size() > cell_capacity) {
+            result.error_msg = "text too large (" + std::to_string(bits.size()) + 
+                              " bits needed, " + std::to_string(cell_capacity) + " available)";
+            return result;
+        }
+        embed_bits_cell_major(png.data.data(), grid, bits, salt, png.has_alpha);
+    } else {
+        if (bits.size() > total_blocks) {
+            result.error_msg = "text too large (" + std::to_string(bits.size()) + 
+                              " bits needed, " + std::to_string(total_blocks) + " available)";
+            return result;
+        }
+        embed_bits_to_image(png.data.data(), grid, bits, salt, png.has_alpha);
     }
-    
-    embed_bits_to_image(png.data.data(), grid, bits, salt, png.has_alpha);
     
     if (!save_png_adaptive(output_png, png.data, png.width, png.height, !png.has_alpha)) {
         result.error_msg = "failed to save PNG: " + output_png;
@@ -730,8 +841,11 @@ ExtractResult extract_text(const std::string& stego_png,
         return result;
     }
     
-    // 1. 先提取 12 字节 header (96 bits)
-    auto header_bits = extract_bits_from_image(png.data.data(), grid, 96, salt, png.has_alpha);
+    // 1. 先提取 12 字节 header (96 bits) - 使用列优先顺序
+    std::vector<size_t> dummy_erasures;
+    auto header_bits = extract_bits_cell_major_with_erasures(
+        png.data.data(), grid, png.width, png.height,
+        96, salt, png.has_alpha, &dummy_erasures, 0, 0);
     if (header_bits.size() < 96) {
         result.error_msg = "not enough data for ECC header";
         return result;
@@ -769,7 +883,10 @@ ExtractResult extract_text(const std::string& stego_png,
         return result;
     }
     
-    auto all_bits = extract_bits_from_image(png.data.data(), grid, total_bits_needed, salt, png.has_alpha);
+    std::vector<size_t> dummy_erasures2;
+    auto all_bits = extract_bits_cell_major_with_erasures(
+        png.data.data(), grid, png.width, png.height,
+        total_bits_needed, salt, png.has_alpha, &dummy_erasures2, 0, 0);
     auto all_bytes = bits_to_bytes(all_bits);
     
     // 4. 提取 ecc_data (跳过12字节 header)
@@ -836,9 +953,9 @@ ExtractResult extract_text_with_erasures(const std::string& stego_png,
     auto try_extract = [&](int lo, int to) -> ExtractResult {
         ExtractResult r;
         
-        // 1. Extract 96 bits header with erasure info
+        // 1. Extract 96 bits header with erasure info (column-major)
         std::vector<size_t> header_erasure_positions;
-        auto header_bits = extract_bits_with_erasures(
+        auto header_bits = extract_bits_cell_major_with_erasures(
             png.data.data(), orig_grid, png.width, png.height,
             96, salt, png.has_alpha, &header_erasure_positions, lo, to);
         
@@ -915,7 +1032,7 @@ ExtractResult extract_text_with_erasures(const std::string& stego_png,
         }
         
         std::vector<size_t> all_erasure_bit_positions;
-        auto all_bits = extract_bits_with_erasures(
+        auto all_bits = extract_bits_cell_major_with_erasures(
             png.data.data(), orig_grid, png.width, png.height,
             total_bits_needed, salt, png.has_alpha, &all_erasure_bit_positions, lo, to);
         
@@ -961,6 +1078,7 @@ ExtractResult extract_text_with_erasures(const std::string& stego_png,
     };
     
     // Scan all possible crop offsets
+    std::string last_error;
     for (int to = 0; to <= max_top_offset; to++) {
         for (int lo = 0; lo <= max_left_offset; lo++) {
             auto r = try_extract(lo, to);
@@ -970,6 +1088,7 @@ ExtractResult extract_text_with_erasures(const std::string& stego_png,
                 }
                 return r;
             }
+            last_error = r.error_msg;
         }
     }
     
@@ -1083,12 +1202,17 @@ EmbedResult embed_text_multicluster(const std::string& input_png,
     result.capacity_bits = min_strip_capacity;
     
     // Embed into each cluster strip
-    for (int c = 0; c < num_clusters; c++) {
-        get_strip_range(grid.grid_rows, num_clusters, c, strip_start, strip_end);
-        uint64_t cluster_seed = salt * 10000 + c;
-        
-        embed_bits_to_strip(png.data.data(), grid, bits, cluster_seed,
-                           png.has_alpha, strip_start, strip_end);
+    if (num_clusters == 1) {
+        // Single cluster: use cell-major ordering for better left/right crop recovery
+        embed_bits_cell_major(png.data.data(), grid, bits, salt, png.has_alpha);
+    } else {
+        for (int c = 0; c < num_clusters; c++) {
+            get_strip_range(grid.grid_rows, num_clusters, c, strip_start, strip_end);
+            uint64_t cluster_seed = salt * 10000 + c;
+            
+            embed_bits_to_strip(png.data.data(), grid, bits, cluster_seed,
+                               png.has_alpha, strip_start, strip_end);
+        }
     }
     
     result.used_bits = bits.size() * num_clusters;
@@ -1127,6 +1251,11 @@ ExtractResult extract_text_multicluster(const std::string& stego_png,
     if (npar <= 0) {
         result.error_msg = "invalid ecc_level";
         return result;
+    }
+    
+    // Single cluster: delegate to cell-major extraction (same as option 4)
+    if (num_clusters == 1) {
+        return extract_text_with_erasures(stego_png, salt, ecc_level, orig_width, orig_height);
     }
     
     // Calculate possible crop offset ranges
