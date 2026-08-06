@@ -132,12 +132,14 @@ static void show_ecc_info(int ecc_level) {
 static bool is_directory(const std::string& path) {
 #ifdef _WIN32
     int len = MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, nullptr, 0);
+    int cp = CP_UTF8;
     if (len <= 0) {
         len = MultiByteToWideChar(CP_ACP, 0, path.c_str(), -1, nullptr, 0);
+        cp = CP_ACP;
         if (len <= 0) return false;
     }
     std::wstring wpath(len, L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, &wpath[0], len);
+    MultiByteToWideChar(cp, 0, path.c_str(), -1, &wpath[0], len);
     while (!wpath.empty() && wpath.back() == L'\0') wpath.pop_back();
     
     DWORD attr = GetFileAttributesW(wpath.c_str());
@@ -153,9 +155,14 @@ static bool is_directory(const std::string& path) {
 static bool file_exists(const std::string& path) {
 #ifdef _WIN32
     int len = MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, nullptr, 0);
-    if (len <= 0) return false;
+    int cp = CP_UTF8;
+    if (len <= 0) {
+        len = MultiByteToWideChar(CP_ACP, 0, path.c_str(), -1, nullptr, 0);
+        cp = CP_ACP;
+        if (len <= 0) return false;
+    }
     std::wstring wpath(len, L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, &wpath[0], len);
+    MultiByteToWideChar(cp, 0, path.c_str(), -1, &wpath[0], len);
     while (!wpath.empty() && wpath.back() == L'\0') wpath.pop_back();
     DWORD attr = GetFileAttributesW(wpath.c_str());
     return attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY);
@@ -178,9 +185,14 @@ static bool has_ext(const std::string& fname, const std::string& ext) {
 static std::string detect_file_signature(const std::string& path) {
 #ifdef _WIN32
     int wlen = MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, nullptr, 0);
-    if (wlen <= 0) return "";
+    int wcp = CP_UTF8;
+    if (wlen <= 0) {
+        wlen = MultiByteToWideChar(CP_ACP, 0, path.c_str(), -1, nullptr, 0);
+        wcp = CP_ACP;
+        if (wlen <= 0) return "";
+    }
     std::wstring wpath(wlen, L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, &wpath[0], wlen);
+    MultiByteToWideChar(wcp, 0, path.c_str(), -1, &wpath[0], wlen);
     while (!wpath.empty() && wpath.back() == L'\0') wpath.pop_back();
     FILE* f = _wfopen(wpath.c_str(), L"rb");
 #else
@@ -226,9 +238,14 @@ static std::vector<std::string> list_png_files(const std::string& dir) {
     std::vector<std::string> files;
 #ifdef _WIN32
     int len = MultiByteToWideChar(CP_UTF8, 0, dir.c_str(), -1, nullptr, 0);
-    if (len <= 0) return files;
+    int cp = CP_UTF8;
+    if (len <= 0) {
+        len = MultiByteToWideChar(CP_ACP, 0, dir.c_str(), -1, nullptr, 0);
+        cp = CP_ACP;
+        if (len <= 0) return files;
+    }
     std::wstring wdir(len, L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, dir.c_str(), -1, &wdir[0], len);
+    MultiByteToWideChar(cp, 0, dir.c_str(), -1, &wdir[0], len);
     while (!wdir.empty() && wdir.back() == L'\0') wdir.pop_back();
     
     std::wstring wpattern = wdir + L"\\*";
@@ -265,9 +282,14 @@ static std::vector<std::string> list_png_files(const std::string& dir) {
     for (const auto& full_path : files) {
 #ifdef _WIN32
         int wlen = MultiByteToWideChar(CP_UTF8, 0, full_path.c_str(), -1, nullptr, 0);
+        int wcp = CP_UTF8;
+        if (wlen <= 0) {
+            wlen = MultiByteToWideChar(CP_ACP, 0, full_path.c_str(), -1, nullptr, 0);
+            wcp = CP_ACP;
+        }
         if (wlen <= 0) { skipped.push_back(full_path); continue; }
         std::wstring wpath(wlen, L'\0');
-        MultiByteToWideChar(CP_UTF8, 0, full_path.c_str(), -1, &wpath[0], wlen);
+        MultiByteToWideChar(wcp, 0, full_path.c_str(), -1, &wpath[0], wlen);
         while (!wpath.empty() && wpath.back() == L'\0') wpath.pop_back();
         FILE* f = _wfopen(wpath.c_str(), L"rb");
 #else
