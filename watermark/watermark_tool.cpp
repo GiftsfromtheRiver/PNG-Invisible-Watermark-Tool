@@ -16,6 +16,7 @@
 #include <cctype>
 #include <cstdio>
 #include <cmath>
+#include <cstring>
 #include <fstream>
 
 #ifdef _WIN32
@@ -174,6 +175,53 @@ static bool has_ext(const std::string& fname, const std::string& ext) {
     return true;
 }
 
+static std::string detect_file_signature(const std::string& path) {
+#ifdef _WIN32
+    int wlen = MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, nullptr, 0);
+    if (wlen <= 0) return "";
+    std::wstring wpath(wlen, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, path.c_str(), -1, &wpath[0], wlen);
+    while (!wpath.empty() && wpath.back() == L'\0') wpath.pop_back();
+    FILE* f = _wfopen(wpath.c_str(), L"rb");
+#else
+    FILE* f = fopen(path.c_str(), "rb");
+#endif
+    if (!f) return "";
+    uint8_t header[8] = {0};
+    size_t n = fread(header, 1, 8, f);
+    fclose(f);
+    if (n == 0) return "";
+
+    std::string hex;
+    for (size_t i = 0; i < n; i++) {
+        char buf[4];
+        snprintf(buf, sizeof(buf), "%02X ", header[i]);
+        hex += buf;
+    }
+    if (!hex.empty() && hex.back() == ' ') hex.pop_back();
+
+    if (n >= 8 && header[0]==0x89 && header[1]==0x50 && header[2]==0x4E && header[3]==0x47
+        && header[4]==0x0D && header[5]==0x0A && header[6]==0x1A && header[7]==0x0A)
+        return "PNG (文件头: 89 50 4E 47 0D 0A 1A 0A)";
+    if (n >= 2 && header[0]==0xFF && header[1]==0xD8)
+        return "JPEG (文件头: FF D8)";
+    if (n >= 4 && header[0]==0x47 && header[1]==0x49 && header[2]==0x46 && header[3]==0x38)
+        return "GIF (文件头: 47 49 46 38)";
+    if (n >= 4 && header[0]==0x52 && header[1]==0x49 && header[2]==0x46 && header[3]==0x46)
+        return "RIFF/WebP (文件头: 52 49 46 46)";
+    if (n >= 2 && header[0]==0x42 && header[1]==0x4D)
+        return "BMP (文件头: 42 4D)";
+    if (n >= 4 && header[0]==0x25 && header[1]==0x50 && header[2]==0x44 && header[3]==0x46)
+        return "PDF (文件头: 25 50 44 46)";
+
+    return "未知格式 (文件头: " + hex + ")";
+}
+
+static bool is_png_file(const std::string& path) {
+    std::string sig = detect_file_signature(path);
+    return sig.find("PNG") != std::string::npos;
+}
+
 static std::vector<std::string> list_png_files(const std::string& dir) {
     std::vector<std::string> files;
 #ifdef _WIN32
@@ -209,6 +257,44 @@ static std::vector<std::string> list_png_files(const std::string& dir) {
     }
     closedir(d);
 #endif
+
+    // 通过文件头魔数验证 PNG 格式 (89 50 4E 47 0D 0A 1A 0A)
+    static const uint8_t png_sig[8] = {0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A};
+    std::vector<std::string> validated;
+    std::vector<std::string> skipped;
+    for (const auto& full_path : files) {
+#ifdef _WIN32
+        int wlen = MultiByteToWideChar(CP_UTF8, 0, full_path.c_str(), -1, nullptr, 0);
+        if (wlen <= 0) { skipped.push_back(full_path); continue; }
+        std::wstring wpath(wlen, L'\0');
+        MultiByteToWideChar(CP_UTF8, 0, full_path.c_str(), -1, &wpath[0], wlen);
+        while (!wpath.empty() && wpath.back() == L'\0') wpath.pop_back();
+        FILE* f = _wfopen(wpath.c_str(), L"rb");
+#else
+        FILE* f = fopen(full_path.c_str(), "rb");
+#endif
+        if (!f) continue;  // 无法打开则跳过，不计入警告
+
+        uint8_t header[8] = {0};
+        size_t nread = fread(header, 1, 8, f);
+        fclose(f);
+
+        if (nread == 8 && memcmp(header, png_sig, 8) == 0) {
+            validated.push_back(full_path);
+        } else {
+            skipped.push_back(full_path);
+        }
+    }
+
+    if (!skipped.empty()) {
+        std::cout << "\n[警告] 以下 " << skipped.size() << " 个文件扩展名为 .png 但不是有效的 PNG 格式，已跳过：\n";
+        for (const auto& sf : skipped) {
+            std::string sig = detect_file_signature(sf);
+            std::cout << "  - " << sf << " (实际: " << (sig.empty() ? "无法读取" : sig) << ")\n";
+        }
+    }
+
+    files = std::move(validated);
     std::sort(files.begin(), files.end());
     return files;
 }
@@ -346,6 +432,12 @@ static void do_embed() {
     }
     
     // 单文件模式
+    if (!is_png_file(input)) {
+        std::string sig = detect_file_signature(input);
+        std::cout << "\n[错误] 该文件不是有效的 PNG 格式" << (sig.empty() ? "" : "，实际为: " + sig) << "\n";
+        return;
+    }
+    
     std::string output = read_path("输出PNG路径 (留空=自动命名): ");
     if (output.empty()) {
         output = auto_output(input);
@@ -409,6 +501,12 @@ static void do_extract() {
     std::string input = read_path("隐写PNG路径: ");
     if (input.empty()) { std::cout << "已取消\n"; return; }
     
+    if (!is_png_file(input)) {
+        std::string sig = detect_file_signature(input);
+        std::cout << "\n[错误] 该文件不是有效的 PNG 格式" << (sig.empty() ? "" : "，实际为: " + sig) << "\n";
+        return;
+    }
+    
     std::string salt_str = read_line("种子密钥 (需与嵌入时一致): ");
     uint64_t salt = parse_salt(salt_str);
     
@@ -438,6 +536,12 @@ static void do_extract_with_erasures() {
     
     std::string input = read_path("截图PNG路径: ");
     if (input.empty()) { std::cout << "已取消\n"; return; }
+    
+    if (!is_png_file(input)) {
+        std::string sig = detect_file_signature(input);
+        std::cout << "\n[错误] 该文件不是有效的 PNG 格式" << (sig.empty() ? "" : "，实际为: " + sig) << "\n";
+        return;
+    }
     
     std::string ow_str = read_line("原始图片宽度 (像素): ");
     std::string oh_str = read_line("原始图片高度 (像素): ");
@@ -494,6 +598,12 @@ static void do_extract_multicluster() {
     
     std::string input = read_path("截图PNG路径: ");
     if (input.empty()) { std::cout << "已取消\n"; return; }
+    
+    if (!is_png_file(input)) {
+        std::string sig = detect_file_signature(input);
+        std::cout << "\n[错误] 该文件不是有效的 PNG 格式" << (sig.empty() ? "" : "，实际为: " + sig) << "\n";
+        return;
+    }
     
     std::string ow_str = read_line("原始图片宽度 (像素): ");
     std::string oh_str = read_line("原始图片高度 (像素): ");
@@ -556,6 +666,12 @@ static void do_capacity() {
     
     std::string input = read_path("PNG图片路径: ");
     if (input.empty()) { std::cout << "已取消\n"; return; }
+    
+    if (!is_png_file(input)) {
+        std::string sig = detect_file_signature(input);
+        std::cout << "\n[错误] 该文件不是有效的 PNG 格式" << (sig.empty() ? "" : "，实际为: " + sig) << "\n";
+        return;
+    }
     
     auto info = get_capacity(input);
     
